@@ -106,7 +106,7 @@ class PairedTransforms:
 
 class TripletSliceDataset(Dataset):
     def __init__(self, patient_folders, transform=None):
-        self.patient_folders = patient_folders  # only folder paths
+        self.patient_folders = [f for f in patient_folders if self.load_volume(f) is not None]  # only folder paths
         self.transform = transform
 
     def __len__(self):
@@ -119,7 +119,7 @@ class TripletSliceDataset(Dataset):
     def __getitem__(self, idx):
         folder = self.patient_folders[idx]
         vol = self.load_volume(folder)  # (Z,H,W)
-
+        
         # Select random triplet inside this volume
         i = np.random.randint(0, vol.shape[0]-2)
         pre = vol[i]
