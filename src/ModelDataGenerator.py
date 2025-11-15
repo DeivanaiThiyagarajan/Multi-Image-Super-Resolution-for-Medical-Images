@@ -25,35 +25,28 @@ def load_correct_study(patient_path):
 
 def load_patient_volume(patient_folder):
 
-    # 1) Find the series folder with exactly 60 dicom slices
     study_folder = load_correct_study(patient_folder)
     if study_folder is None:
         return None
 
-    # 2) Let SimpleITK detect the series inside the folder
-    reader = sitk.ImageSeriesReader()
-    series_IDs = reader.GetGDCMSeriesIDs(study_folder)
-
-    if not series_IDs:
-        print(f"No DICOM series found in {study_folder}")
+    # Read all DICOM slices in the folder
+    dcm_files = sorted([os.path.join(study_folder, f) 
+                        for f in os.listdir(study_folder) 
+                        if f.lower().endswith('.dcm')])
+    if len(dcm_files) < 3:
+        # Not enough slices for triplet selection
         return None
 
-    # Usually just 1 series — get it
-    series_files = reader.GetGDCMSeriesFileNames(study_folder, series_IDs[0])
+    slices = []
+    for f in dcm_files:
+        img = sitk.ReadImage(f)
+        arr = sitk.GetArrayFromImage(img)[0]  # (1,H,W) -> (H,W)
+        slices.append(arr.astype(np.float32))
 
-    # 3) Read the entire volume in a SINGLE call
-    reader.SetFileNames(series_files)
-    img = reader.Execute() 
-
-    # 4) Convert to numpy (Z,H,W)
-    vol = sitk.GetArrayFromImage(img).astype(np.float32)
-
-    # volume shape check
-    if vol.shape[0] != 60:
-        print(f"Warning: expected 60 slices, got {vol.shape[0]}")
-        return None
-
-    return vol
+    # Stack into a volume (Z,H,W)
+    volume_np = np.stack(slices, axis=0)
+    
+    return volume_np
 
 def generate_consecutive_triplets(volume):
     """
@@ -107,6 +100,7 @@ class PairedTransforms:
 class TripletSliceDataset(Dataset):
     def __init__(self, patient_folders, transform=None):
         self.patient_folders = [f for f in patient_folders if self.load_volume(f) is not None]  # only folder paths
+        print(len(self.patient_folders), "valid patient folders found.")
         self.transform = transform
 
     def __len__(self):
