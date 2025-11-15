@@ -197,7 +197,7 @@ def build_dataloader(split="train",
 
     transform = PairedTransforms() if augment else None
 
-    dataset = TripletSliceDataset(all_pre, all_post, all_mid, transform)
+    dataset = TripletSliceDataset(folders, transform)
 
     # ---------------------------------------------------------
     # Build DataLoader
