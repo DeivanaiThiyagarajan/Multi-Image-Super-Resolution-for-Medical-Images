@@ -172,6 +172,12 @@ class TripletSliceDataset(Dataset):
         post = post_list[triplet_idx]
         mid = mid_list[triplet_idx]
 
+        # Resize to 256x256 BEFORE transforms to ensure uniform batch sizes
+        target_size = (256, 256)
+        pre = TF.resize(pre, target_size, interpolation=TF.InterpolationMode.BILINEAR)
+        post = TF.resize(post, target_size, interpolation=TF.InterpolationMode.BILINEAR)
+        mid = TF.resize(mid, target_size, interpolation=TF.InterpolationMode.BILINEAR)
+
         sample = {"pre": pre, "post": post, "target": mid}
         if self.transform:
             sample = self.transform(sample)
