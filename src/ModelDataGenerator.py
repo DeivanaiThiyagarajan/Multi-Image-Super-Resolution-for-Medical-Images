@@ -14,31 +14,36 @@ BASE_DIR = os.path.join(parent_directory, 'data','manifest-1694710246744','Prost
 
 def load_correct_study(patient_path):
     """
-    Find subfolder containing exactly 60 DICOM files.
+    Find all subfolders containing exactly 60 DICOM files.
+    Returns a list of paths.
     """
+    series_folders = []
     for root, dirs, files in os.walk(patient_path):
         dcm_files = [f for f in files if f.lower().endswith(".dcm")]
         if len(dcm_files) == 60:
-            return root
-    return None
+            series_folders.append(root)
+    return series_folders if series_folders else None
 
-def count_slices(patient_folder):
-    study_folder = load_correct_study(patient_folder)
-    if study_folder is None:
+def count_slices(current_folder):
+    if current_folder is None:
         return 0
-    dcm_files = [f for f in os.listdir(study_folder) if f.lower().endswith(".dcm")]
+    dcm_files = [f for f in os.listdir(current_folder) if f.lower().endswith(".dcm")]
     return len(dcm_files)
 
-def load_patient_volume(patient_folder):
-
-    study_folder = load_correct_study(patient_folder)
-    #print(study_folder)
-    if study_folder is None:
+def load_patient_volume(series_folder_path):
+    """
+    Load volume from a specific series folder path.
+    Args:
+        series_folder_path: Direct path to folder containing 60 DICOM files
+    Returns:
+        volume_np: (Z, H, W) numpy array
+    """
+    if series_folder_path is None:
         return None
 
     # Read all DICOM slices in the folder
-    dcm_files = sorted([os.path.join(study_folder, f) 
-                        for f in os.listdir(study_folder) 
+    dcm_files = sorted([os.path.join(series_folder_path, f) 
+                        for f in os.listdir(series_folder_path) 
                         if f.lower().endswith('.dcm')])
     if len(dcm_files) < 3:
         # Not enough slices for triplet selection
@@ -78,7 +83,7 @@ def generate_consecutive_triplets(volume):
     # Distance 4
     for i in range(volume.shape[0] - 4):
         pre_slice = (volume[i] - volume[i].mean()) / (volume[i].std()+1e-6)
-        mid_slice = (volume[i+1] - volume[i+2].mean()) / (volume[i+2].std()+1e-6)
+        mid_slice = (volume[i+2] - volume[i+2].mean()) / (volume[i+2].std()+1e-6)
         post_slice = (volume[i+4] - volume[i+4].mean()) / (volume[i+4].std()+1e-6)
         pre_slice  = torch.tensor(pre_slice).unsqueeze(0)
         mid_slice  = torch.tensor(mid_slice).unsqueeze(0)
@@ -120,22 +125,47 @@ class TripletSliceDataset(Dataset):
     def __init__(self, patient_folders, transform=None):
         self.transform = transform
         self.patient_folders = patient_folders
-        self.triplet_indices = []
+        self.triplet_indices = []  # Stores (patient_idx, series_idx, triplet_idx)
+        self.patient_series_map = {}  # Maps patient_idx to list of series paths
+        
+        # Build map of patient -> list of series folders (lazy discovery)
         for pid, folder in enumerate(patient_folders):
-            n_slices = count_slices(folder)
-            if n_slices < 3:
-                continue
-            n_triplets = (n_slices - 2) + (n_slices - 4)
-            for t in range(n_triplets):
-                self.triplet_indices.append((pid, t))
+            series_folders = load_correct_study(folder)
+            if series_folders is not None:
+                self.patient_series_map[pid] = series_folders
+            else:
+                self.patient_series_map[pid] = []
+        
+        # Build triplet indices (still lazy about loading volumes)
+        for pid, series_list in self.patient_series_map.items():
+            for series_idx, series_folder in enumerate(series_list):
+                n_slices = count_slices(series_folder)
+                if n_slices < 3:
+                    continue
+                # Distance 2 triplets: (i, i+2) -> i+1
+                n_triplets_d2 = n_slices - 2
+                # Distance 4 triplets: (i, i+4) -> i+2
+                n_triplets_d4 = n_slices - 4
+                n_total_triplets = n_triplets_d2 + n_triplets_d4
+                
+                for t in range(n_total_triplets):
+                    self.triplet_indices.append((pid, series_idx, t))
 
     def __len__(self):
         return len(self.triplet_indices)
 
     def __getitem__(self, idx):
-        patient_idx, triplet_idx = self.triplet_indices[idx]
-        folder = self.patient_folders[patient_idx]
-        vol = load_patient_volume(folder)  # only load when needed
+        patient_idx, series_idx, triplet_idx = self.triplet_indices[idx]
+        
+        # Get the specific series folder for this patient
+        series_folder = self.patient_series_map[patient_idx][series_idx]
+        
+        # Load volume only when needed (lazy loading)
+        vol = load_patient_volume(series_folder)
+        if vol is None:
+            raise ValueError(f"Failed to load volume from {series_folder}")
+        
+        # Generate triplets on-the-fly
         pre_list, post_list, mid_list = generate_consecutive_triplets(vol)
 
         pre = pre_list[triplet_idx]
