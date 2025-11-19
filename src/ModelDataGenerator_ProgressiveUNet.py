@@ -66,30 +66,34 @@ def load_patient_volume(series_folder_path):
     return volume_np
 
 
-def generate_consecutive_5tuples(volume):
+def count_slices(series_folder_path):
+    """Count DICOM slices in folder without loading"""
+    if series_folder_path is None:
+        return 0
+    dcm_files = [f for f in os.listdir(series_folder_path) if f.lower().endswith(".dcm")]
+    return len(dcm_files)
+
+
+def get_5slice_window(volume, window_idx):
     """
-    Generate 5-consecutive-slice windows from volume:
-    [slice[i], slice[i+1], slice[i+2], slice[i+3], slice[i+4]]
-    
-    Returns list of (5, H, W) windows
+    Get a single 5-consecutive-slice window from volume.
+    Args:
+        volume: (Z, H, W) numpy array
+        window_idx: Index of window to extract
+    Returns:
+        window: (5, H, W) normalized window
     """
-    windows = []
+    i = window_idx
+    slices_5 = []
+    for j in range(5):
+        s = volume[i + j].astype(np.float32)
+        # Z-score normalization per slice
+        s_normalized = (s - s.mean()) / (s.std() + 1e-6)
+        slices_5.append(s_normalized)
     
-    # Create all 5-consecutive windows
-    for i in range(volume.shape[0] - 4):
-        # Normalize each slice independently
-        slices_5 = []
-        for j in range(5):
-            s = volume[i + j].astype(np.float32)
-            # Z-score normalization per slice
-            s_normalized = (s - s.mean()) / (s.std() + 1e-6)
-            slices_5.append(s_normalized)
-        
-        # Stack into (5, H, W)
-        window = np.stack(slices_5, axis=0)
-        windows.append(window)
-    
-    return windows
+    # Stack into (5, H, W)
+    window = np.stack(slices_5, axis=0)
+    return window
 
 
 class ProgressiveUNetDataset(Dataset):
@@ -109,6 +113,7 @@ class ProgressiveUNetDataset(Dataset):
     No windows span across different patients (prevents data leakage).
     
     Uses lazy loading (like ModelDataGenerator.py) - only loads volumes on demand in __getitem__
+    Only counts slices in __len__ (no loading)
     """
     
     def __init__(self, patient_folders, augment=False):
@@ -120,19 +125,19 @@ class ProgressiveUNetDataset(Dataset):
         self.patient_folders = patient_folders
         self.augment = augment
         
-        # Cache for loaded volumes: {(patient_idx, series_idx): (volume, windows)}
+        # Cache for loaded volumes: {(patient_idx, series_idx): volume}
         self._volume_cache = {}
         
-        # Build patient-series mappings (lazy - only list folders, don't load)
-        self._build_patient_series_map()
+        # Build patient-series mappings and window counts (NO loading yet)
+        self._build_indices()
     
-    def _build_patient_series_map(self):
+    def _build_indices(self):
         """
-        Build mapping of patient -> series folders.
+        Build mapping of patient -> series folders and count windows per series.
         Does NOT load volumes yet (lazy loading in __getitem__)
         """
         self.patient_series_map = {}  # patient_idx -> [series_folders]
-        self.patient_series_counts = {}  # patient_idx -> num_series
+        self.window_indices = []  # List of (patient_idx, series_idx, window_idx)
         
         for patient_idx, patient_folder in enumerate(self.patient_folders):
             series_folders = load_correct_study(patient_folder)
@@ -141,13 +146,34 @@ class ProgressiveUNetDataset(Dataset):
                 continue
             
             self.patient_series_map[patient_idx] = series_folders
-            self.patient_series_counts[patient_idx] = len(series_folders)
+            
+            # For each series, count windows WITHOUT loading volume
+            for series_idx, series_folder in enumerate(series_folders):
+                n_slices = count_slices(series_folder)
+                
+                if n_slices < 5:
+                    # Not enough slices for 5-slice windows
+                    continue
+                
+                # Number of 5-consecutive windows: n_slices - 4
+                n_windows = n_slices - 4
+                
+                # Add indices for all windows in this series
+                for window_idx in range(n_windows):
+                    self.window_indices.append((patient_idx, series_idx, window_idx))
     
-    def _get_num_windows_for_series(self, patient_idx, series_idx):
+    def __len__(self):
+        """Total number of 5-slice windows (computed without loading)"""
+        return len(self.window_indices)
+    
+    def __getitem__(self, idx):
         """
-        Get number of 5-slice windows for a specific series.
-        Loads volume to check but caches it.
+        Lazy loading: convert flat index to (patient_idx, series_idx, window_idx)
+        Load volume only when needed, then cache it.
         """
+        patient_idx, series_idx, window_idx = self.window_indices[idx]
+        
+        # Get or load the volume for this series
         cache_key = (patient_idx, series_idx)
         
         if cache_key not in self._volume_cache:
@@ -156,71 +182,31 @@ class ProgressiveUNetDataset(Dataset):
             volume = load_patient_volume(series_folder)
             
             if volume is None:
-                return 0
+                raise RuntimeError(f"Failed to load volume from {series_folder}")
             
-            windows = generate_consecutive_5tuples(volume)
-            self._volume_cache[cache_key] = (volume, windows)
+            self._volume_cache[cache_key] = volume
         
-        _, windows = self._volume_cache[cache_key]
-        return len(windows)
-    
-    def __len__(self):
-        """
-        Total number of 5-slice windows across all patients and series.
-        Computed lazily by checking each series.
-        """
-        total = 0
-        for patient_idx in self.patient_series_map.keys():
-            n_series = self.patient_series_counts[patient_idx]
-            for series_idx in range(n_series):
-                total += self._get_num_windows_for_series(patient_idx, series_idx)
-        return total
-    
-    def __getitem__(self, idx):
-        """
-        Lazy loading: convert flat index to (patient_idx, series_idx, window_idx)
-        Load volume only when needed, then cache it.
-        """
-        # Convert flat index to (patient_idx, series_idx, window_idx)
-        current_idx = 0
+        volume = self._volume_cache[cache_key]
         
-        for patient_idx in sorted(self.patient_series_map.keys()):
-            n_series = self.patient_series_counts[patient_idx]
-            
-            for series_idx in range(n_series):
-                n_windows = self._get_num_windows_for_series(patient_idx, series_idx)
-                
-                if current_idx + n_windows > idx:
-                    # Found the right series
-                    window_idx = idx - current_idx
-                    
-                    # Get cached volume and windows
-                    cache_key = (patient_idx, series_idx)
-                    volume, windows = self._volume_cache[cache_key]
-                    
-                    # Get the specific window
-                    window = windows[window_idx]  # (5, H, W)
-                    
-                    # Convert to tensor
-                    window_tensor = torch.from_numpy(window).float()  # (5, H, W)
-                    
-                    # Resize to 256x256 for uniform batch sizes
-                    window_tensor = TF.interpolate(
-                        window_tensor.unsqueeze(0),  # (1, 5, H, W)
-                        size=(256, 256),
-                        mode='bilinear',
-                        align_corners=False
-                    ).squeeze(0)  # (5, H, W)
-                    
-                    # Apply augmentation if needed
-                    if self.augment:
-                        window_tensor = self._apply_augmentation(window_tensor)
-                    
-                    return window_tensor
-                
-                current_idx += n_windows
+        # Get the specific 5-slice window from the volume
+        window = get_5slice_window(volume, window_idx)  # (5, H, W)
         
-        raise IndexError(f"Index {idx} out of range for dataset")
+        # Convert to tensor
+        window_tensor = torch.from_numpy(window).float()  # (5, H, W)
+        
+        # Resize to 256x256 for uniform batch sizes
+        window_tensor = TF.interpolate(
+            window_tensor.unsqueeze(0),  # (1, 5, H, W)
+            size=(256, 256),
+            mode='bilinear',
+            align_corners=False
+        ).squeeze(0)  # (5, H, W)
+        
+        # Apply augmentation if needed
+        if self.augment:
+            window_tensor = self._apply_augmentation(window_tensor)
+        
+        return window_tensor
     
     def _apply_augmentation(self, window_tensor):
         """Apply augmentations consistently across all 5 slices"""
