@@ -125,9 +125,6 @@ class ProgressiveUNetDataset(Dataset):
         self.patient_folders = patient_folders
         self.augment = augment
         
-        # Cache for loaded volumes: {(patient_idx, series_idx): volume}
-        self._volume_cache = {}
-        
         # Build patient-series mappings and window counts (NO loading yet)
         self._build_indices()
     
@@ -169,24 +166,16 @@ class ProgressiveUNetDataset(Dataset):
     def __getitem__(self, idx):
         """
         Lazy loading: convert flat index to (patient_idx, series_idx, window_idx)
-        Load volume only when needed, then cache it.
+        Load volume only when needed (no caching to avoid multiprocessing issues)
         """
         patient_idx, series_idx, window_idx = self.window_indices[idx]
         
-        # Get or load the volume for this series
-        cache_key = (patient_idx, series_idx)
+        # Load the volume for this series (fresh load every time)
+        series_folder = self.patient_series_map[patient_idx][series_idx]
+        volume = load_patient_volume(series_folder)
         
-        if cache_key not in self._volume_cache:
-            # Load and cache the volume
-            series_folder = self.patient_series_map[patient_idx][series_idx]
-            volume = load_patient_volume(series_folder)
-            
-            if volume is None:
-                raise RuntimeError(f"Failed to load volume from {series_folder}")
-            
-            self._volume_cache[cache_key] = volume
-        
-        volume = self._volume_cache[cache_key]
+        if volume is None:
+            raise RuntimeError(f"Failed to load volume from {series_folder}")
         
         # Get the specific 5-slice window from the volume
         window = get_5slice_window(volume, window_idx)  # (5, H, W)
