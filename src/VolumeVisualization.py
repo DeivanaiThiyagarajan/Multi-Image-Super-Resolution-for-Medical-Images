@@ -150,9 +150,10 @@ def batch_triplets_for_inference(triplets, batch_size=32):
 def load_model(model_name, device='cuda'):
     """
     Load the best model checkpoint for the given model name.
+    Uses correct model architectures from ModelLoader.py
     
     Args:
-        model_name: Model identifier - 'unet', 'deepcnn', 'progressive_unet', 'unet_gan', 'fastddpm'
+        model_name: Model identifier - 'unet', 'deepcnn', 'progressive_unet', 'unet_gan'
         device: 'cuda' or 'cpu'
     
     Returns:
@@ -161,50 +162,8 @@ def load_model(model_name, device='cuda'):
     Raises:
         ValueError: If model_name not recognized or checkpoint not found
     """
-    parent_dir = os.path.dirname(os.getcwd())
-    models_dir = os.path.join(parent_dir, 'models')
-    
-    # Map model names to checkpoint filenames
-    checkpoint_map = {
-        'unet': 'unet_best.pt',
-        'deepcnn': 'deepcnn_best.pt',
-        'progressive_unet': 'progressive_unet_best.pt',
-        'unet_gan': 'unet_gan_generator_best.pt',
-        'fastddpm': 'fastddpm_best.pt'
-    }
-    
-    if model_name.lower() not in checkpoint_map:
-        raise ValueError(f"Unknown model: {model_name}. Choose from: {list(checkpoint_map.keys())}")
-    
-    checkpoint_file = os.path.join(models_dir, checkpoint_map[model_name.lower()])
-    
-    if not os.path.exists(checkpoint_file):
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_file}")
-    
-    # Import model architectures
-    if model_name.lower() == 'unet':
-        from unet_model import UNet
-        model = UNet(in_channels=2, out_channels=1).to(device)
-    elif model_name.lower() == 'deepcnn':
-        from unet_model import DeepCNN
-        model = DeepCNN(in_channels=2, out_channels=1).to(device)
-    elif model_name.lower() == 'progressive_unet':
-        from unet_model import ProgressiveUNet
-        model = ProgressiveUNet(in_channels=2, out_channels=3).to(device)
-    elif model_name.lower() == 'unet_gan':
-        from unet_model import UNet
-        model = UNet(in_channels=2, out_channels=1).to(device)
-    elif model_name.lower() == 'fastddpm':
-        # This would need FastDDPMUNet from FastDDPM notebook
-        raise NotImplementedError("FastDDPM requires DDPMScheduler - implement separately")
-    
-    # Load checkpoint
-    model.load_state_dict(torch.load(checkpoint_file, map_location=device))
-    model.eval()
-    
-    print(f"✓ Loaded {model_name} model from {checkpoint_file}")
-    
-    return model
+    from ModelLoader import load_model as loader_load_model
+    return loader_load_model(model_name, device=device)
 
 
 def compute_metrics(original, predicted):
