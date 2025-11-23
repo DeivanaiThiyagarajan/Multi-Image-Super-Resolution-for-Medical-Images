@@ -207,20 +207,152 @@ def load_model(model_name, device='cuda'):
     return model
 
 
-def predict_volume_and_visualize(model_name, seed=None, device='cuda', batch_size=8, save_path=None):
+def compute_metrics(original, predicted):
+    """Compute SSIM, PSNR, and MAE between original and predicted volumes"""
+    # Normalize volumes
+    orig_norm = (original - original.min()) / (original.max() - original.min() + 1e-8)
+    pred_norm = (predicted - predicted.min()) / (predicted.max() - predicted.min() + 1e-8)
     
+    # Compute metrics across all slices
+    ssim_scores = []
+    psnr_scores = []
+    
+    for i in range(len(original)):
+        ssim_scores.append(ssim(orig_norm[i], pred_norm[i], data_range=1.0))
+        psnr_scores.append(psnr(orig_norm[i], pred_norm[i], data_range=1.0))
+    
+    mae = np.mean(np.abs(orig_norm - pred_norm))
+    
+    return {
+        'ssim_mean': np.mean(ssim_scores),
+        'ssim_std': np.std(ssim_scores),
+        'psnr_mean': np.mean(psnr_scores),
+        'psnr_std': np.std(psnr_scores),
+        'mae': mae,
+        'orig_norm': orig_norm,
+        'pred_norm': pred_norm
+    }
+
+
+def visualize_all_models_parallel(all_models, volume_original, patient_name, seed=None, save_path=None):
+    """
+    Visualize all model outputs in parallel views (sagittal and axial)
+    
+    Args:
+        all_models: Dictionary with model names as keys and predicted volumes as values
+        volume_original: Original volume (Z, H, W)
+        patient_name: Patient identifier string
+        seed: Random seed used
+        save_path: Path to save the figure
+    """
     print(f"\n{'='*70}")
-    print(f"VOLUME PREDICTION & VISUALIZATION: {model_name.upper()}")
+    print(f"PARALLEL VISUALIZATION - ALL MODELS")
     print(f"{'='*70}")
     
-    # Load model
-    print(f"\n1. Loading model...")
-    model = load_model(model_name, device=device)
+    # Compute metrics for each model
+    print(f"\n📊 Computing metrics for all models...")
+    metrics_dict = {}
     
-    # Load random patient volume and triplets
-    print(f"2. Loading random patient from test set...")
+    # Normalize original volume
+    orig_norm = (volume_original - volume_original.min()) / (volume_original.max() - volume_original.min() + 1e-8)
+    
+    for model_name, volume_pred in all_models.items():
+        metrics = compute_metrics(volume_original, volume_pred)
+        metrics_dict[model_name] = metrics
+        print(f"   {model_name:15s} | SSIM: {metrics['ssim_mean']:.4f}±{metrics['ssim_std']:.3f} | "
+              f"PSNR: {metrics['psnr_mean']:.2f}±{metrics['psnr_std']:.2f} | MAE: {metrics['mae']:.4f}")
+    
+    # Create comprehensive visualization
+    print(f"\n🎨 Generating parallel visualization...")
+    
+    num_models = len(all_models) + 1  # +1 for original
+    model_names = ['Original'] + list(all_models.keys())
+    
+    # 2 views per model (sagittal and axial)
+    fig = plt.figure(figsize=(22, 5 * num_models))
+    
+    # Select slice indices for visualization
+    sagittal_x = 128  # Middle X position for sagittal view
+    axial_z = 30      # Middle Z position for axial view
+    
+    for row, (model_idx, model_name) in enumerate(enumerate(model_names)):
+        if model_name == 'Original':
+            volume_to_show = orig_norm
+            metrics = None
+        else:
+            volume_to_show = metrics_dict[model_name]['pred_norm']
+            metrics = metrics_dict[model_name]
+        
+        # ===== SAGITTAL VIEW (Y-Z plane at x=sagittal_x) =====
+        ax_sag = plt.subplot(num_models, 2, row * 2 + 1)
+        
+        sagittal_view = volume_to_show[:, sagittal_x, :]
+        im_sag = ax_sag.imshow(sagittal_view.T, cmap='gray', aspect='auto', origin='lower')
+        
+        if model_name == 'Original':
+            ax_sag.set_title(f'Sagittal View (X={sagittal_x})', fontsize=12, fontweight='bold', color='black')
+        else:
+            title = f'{model_name.upper()} - Sagittal\nSSIM: {metrics["ssim_mean"]:.4f} | PSNR: {metrics["psnr_mean"]:.2f}'
+            ax_sag.set_title(title, fontsize=11, fontweight='bold', color='darkblue')
+        
+        ax_sag.set_xlabel('Slice Index (Z)', fontsize=10)
+        ax_sag.set_ylabel('Y Position', fontsize=10)
+        cbar_sag = plt.colorbar(im_sag, ax=ax_sag, fraction=0.046, pad=0.04)
+        cbar_sag.set_label('Intensity', fontsize=9)
+        
+        # ===== AXIAL VIEW (X-Y plane at z=axial_z) =====
+        ax_ax = plt.subplot(num_models, 2, row * 2 + 2)
+        
+        axial_view = volume_to_show[axial_z, :, :]
+        im_ax = ax_ax.imshow(axial_view, cmap='gray', aspect='auto', origin='lower')
+        
+        if model_name == 'Original':
+            ax_ax.set_title(f'Axial View (Z={axial_z})', fontsize=12, fontweight='bold', color='black')
+        else:
+            title = f'{model_name.upper()} - Axial\nMAE: {metrics["mae"]:.4f}'
+            ax_ax.set_title(title, fontsize=11, fontweight='bold', color='darkgreen')
+        
+        ax_ax.set_xlabel('X Position', fontsize=10)
+        ax_ax.set_ylabel('Y Position', fontsize=10)
+        cbar_ax = plt.colorbar(im_ax, ax=ax_ax, fraction=0.046, pad=0.04)
+        cbar_ax.set_label('Intensity', fontsize=9)
+    
+    # Overall title
+    title_str = f'Multi-Model Comparison - Sagittal & Axial Views\nPatient: {patient_name} (Seed: {seed})'
+    fig.suptitle(title_str, fontsize=15, fontweight='bold', y=0.995)
+    
+    plt.tight_layout(rect=[0, 0, 1, 0.99])
+    
+    # Save if path provided
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"   ✓ Visualization saved to: {save_path}")
+    
+    plt.show()
+    
+    return metrics_dict
+
+
+def predict_volume_and_visualize(seed=None, device='cuda', batch_size=8, save_path=None, parallel_viz=True):
+    """
+    Predict volumes using all models and visualize them.
+    
+    Args:
+        seed: Random seed for reproducibility
+        device: 'cuda' or 'cpu'
+        batch_size: Batch size for inference
+        save_path: Path to save the final visualization
+        parallel_viz: If True, show all models in parallel views
+    """
+    
+    print(f"\n{'='*70}")
+    print(f"MULTI-MODEL VOLUME PREDICTION & VISUALIZATION")
+    print(f"{'='*70}")
+    
+    print(f"\n1. Loading random patient from test set...")
     data = get_patient_volume_and_triplets(seed=seed)
-    
+
     volume_original = data['volume']
     triplets = data['triplets']
     patient_name = data['patient_name']
@@ -228,100 +360,100 @@ def predict_volume_and_visualize(model_name, seed=None, device='cuda', batch_siz
     print(f"   Patient: {patient_name}")
     print(f"   Volume shape: {volume_original.shape}")
     print(f"   Triplets: {len(triplets)}")
-    
-    # Create predicted volume (copy of original, will fill in predicted middle slices)
-    volume_predicted = volume_original.copy()
-    
+
     # Run inference on all triplets
-    print(f"3. Running inference on triplets...")
-    predictions_dict = {}
+    print(f"\n2. Running inference with all models...")
     
-    with torch.no_grad():
-        for pre_batch, post_batch, indices in batch_triplets_for_inference(triplets, batch_size=batch_size):
-            pre_batch = pre_batch.to(device)
-            post_batch = post_batch.to(device)
-            
-            # Stack pre and post as input
-            x_input = torch.cat([pre_batch, post_batch], dim=1)  # (B, 2, H, W)
-            
-            # Predict
-            predictions = model(x_input)  # Output shape depends on model
-            
-            # Handle different model output shapes
-            if model_name.lower() == 'progressive_unet':
-                # Progressive UNet outputs 3 channels (3 predictions)
-                pred_middle = predictions[:, 1:2, :, :]  # Take middle prediction
-            else:
-                # UNet, DeepCNN, UNet-GAN output 1 channel
-                pred_middle = predictions  # (B, 1, H, W)
-            
-            # Store predictions indexed by middle slice index
-            for idx, pred in zip(indices, pred_middle):
-                predictions_dict[idx] = pred.cpu().numpy()[0]  # (H, W)
+    all_models = {}
+    model_list = ['unet', 'deepcnn', 'progressive_unet', 'unet_gan']
     
-    # Fill in predicted volume
-    print(f"4. Reconstructing predicted volume...")
-    for idx, pred in predictions_dict.items():
-        volume_predicted[idx] = pred
-    
-    # Calculate metrics
-    print(f"5. Computing metrics...")
-    
-    # Normalize for fair comparison
-    orig_norm = (volume_original - volume_original.min()) / (volume_original.max() - volume_original.min() + 1e-8)
-    pred_norm = (volume_predicted - volume_predicted.min()) / (volume_predicted.max() - volume_predicted.min() + 1e-8)
-    
-    ssim_score = ssim(orig_norm, pred_norm, data_range=1.0)
-    psnr_score = psnr(orig_norm, pred_norm, data_range=1.0)
-    mae_score = np.mean(np.abs(orig_norm - pred_norm))
-    
-    print(f"   SSIM: {ssim_score:.4f}")
-    print(f"   PSNR: {psnr_score:.2f} dB")
-    print(f"   MAE:  {mae_score:.4f}")
-    
-    # Visualize side-by-side sagittal views
-    print(f"6. Generating visualization...")
-    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-    
-    # Select 3 x-positions for sagittal views
-    x_positions = [64, 128, 192]
-    
-    for col, x_pos in enumerate(x_positions):
-        # Original sagittal (Y-Z plane)
-        orig_sagittal = orig_norm[:, x_pos, :]
-        im0 = axes[0, col].imshow(orig_sagittal.T, cmap='gray', aspect='auto')
-        axes[0, col].set_title(f'Original Sagittal (X={x_pos})', fontsize=11, fontweight='bold')
-        axes[0, col].set_xlabel('Slice Index (Z)')
-        axes[0, col].set_ylabel('Y Position')
-        plt.colorbar(im0, ax=axes[0, col], fraction=0.046)
+    for model_name in model_list:
+        print(f"\n   ⏳ Processing {model_name.upper()}...")
         
-        # Predicted sagittal (Y-Z plane)
-        pred_sagittal = pred_norm[:, x_pos, :]
-        im1 = axes[1, col].imshow(pred_sagittal.T, cmap='gray', aspect='auto')
-        axes[1, col].set_title(f'Predicted Sagittal (X={x_pos})', fontsize=11, fontweight='bold')
-        axes[1, col].set_xlabel('Slice Index (Z)')
-        axes[1, col].set_ylabel('Y Position')
-        plt.colorbar(im1, ax=axes[1, col], fraction=0.046)
+        try:
+            model = load_model(model_name, device=device)
+        except (FileNotFoundError, NotImplementedError) as e:
+            print(f"      ⚠️  Skipped: {str(e)}")
+            continue
+
+        # Create predicted volume (copy of original, will fill in predicted middle slices)
+        volume_predicted = volume_original.copy()
+        predictions_dict = {}
+
+        with torch.no_grad():
+            for pre_batch, post_batch, indices in batch_triplets_for_inference(triplets, batch_size=batch_size):
+                pre_batch = pre_batch.to(device)
+                post_batch = post_batch.to(device)
+            
+                # Stack pre and post as input
+                x_input = torch.cat([pre_batch, post_batch], dim=1)  # (B, 2, H, W)
+            
+                # Predict
+                predictions = model(x_input)  # Output shape depends on model
+            
+                # Handle different model output shapes
+                if model_name.lower() == 'progressive_unet':
+                    # Progressive UNet outputs 3 channels (3 predictions)
+                    pred_middle = predictions[:, 1:2, :, :]  # Take middle prediction
+                else:
+                    # UNet, DeepCNN, UNet-GAN output 1 channel
+                    pred_middle = predictions  # (B, 1, H, W)
+            
+                # Store predictions indexed by middle slice index
+                for idx, pred in zip(indices, pred_middle):
+                    predictions_dict[idx] = pred.cpu().numpy()[0]  # (H, W)
     
-    # Add overall title with metrics
-    fig.suptitle(
-        f'{model_name.upper()} - Volume Prediction & Sagittal Comparison\n'
-        f'Patient: {patient_name} | SSIM: {ssim_score:.4f} | PSNR: {psnr_score:.2f} dB | MAE: {mae_score:.4f}',
-        fontsize=13, fontweight='bold'
-    )
+        # Fill in predicted volume
+        for idx, pred in predictions_dict.items():
+            volume_predicted[idx] = pred
+
+        all_models[model_name] = volume_predicted
+        print(f"      ✓ {model_name.upper()} prediction complete")
     
-    plt.tight_layout()
-    
-    # Save if path provided
-    if save_path:
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"   Visualization saved to: {save_path}")
-    
-    plt.show()
+    if parallel_viz:
+        # Show all models in parallel
+        visualize_all_models_parallel(all_models, volume_original, patient_name, seed=seed, save_path=save_path)
+    else:
+        # Show individual model visualization (legacy)
+        print(f"\n3. Generating individual model visualizations...")
+        for model_name, volume_pred in all_models.items():
+            metrics = compute_metrics(volume_original, volume_pred)
+            
+            # Visualization code for single model
+            fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+            
+            x_positions = [64, 128, 192]
+            orig_norm = metrics['orig_norm']
+            pred_norm = metrics['pred_norm']
+            
+            for col, x_pos in enumerate(x_positions):
+                # Original sagittal
+                orig_sagittal = orig_norm[:, x_pos, :]
+                im0 = axes[0, col].imshow(orig_sagittal.T, cmap='gray', aspect='auto')
+                axes[0, col].set_title(f'Original Sagittal (X={x_pos})', fontsize=11, fontweight='bold')
+                axes[0, col].set_xlabel('Slice Index (Z)')
+                axes[0, col].set_ylabel('Y Position')
+                plt.colorbar(im0, ax=axes[0, col], fraction=0.046)
+                
+                # Predicted sagittal
+                pred_sagittal = pred_norm[:, x_pos, :]
+                im1 = axes[1, col].imshow(pred_sagittal.T, cmap='gray', aspect='auto')
+                axes[1, col].set_title(f'{model_name.upper()} Sagittal (X={x_pos})', fontsize=11, fontweight='bold')
+                axes[1, col].set_xlabel('Slice Index (Z)')
+                axes[1, col].set_ylabel('Y Position')
+                plt.colorbar(im1, ax=axes[1, col], fraction=0.046)
+            
+            fig.suptitle(
+                f'{model_name.upper()} - Volume Prediction & Sagittal Comparison\n'
+                f'Patient: {patient_name} | SSIM: {metrics["ssim_mean"]:.4f} | PSNR: {metrics["psnr_mean"]:.2f} dB | MAE: {metrics["mae"]:.4f}',
+                fontsize=13, fontweight='bold'
+            )
+            
+            plt.tight_layout()
+            plt.show()
     
     print(f"\n{'='*70}")
-    print(f"PREDICTION COMPLETE!")
+    print(f"✅ PREDICTION COMPLETE!")
     print(f"{'='*70}\n")
 
 
