@@ -7,6 +7,7 @@ import torch
 import matplotlib.pyplot as plt
 from skimage.metrics import structural_similarity as ssim
 from skimage.metrics import peak_signal_noise_ratio as psnr
+import torchvision.transforms.functional as TF
 
 parent_directory = os.path.dirname(os.getcwd())
 BASE_DIR = os.path.join(parent_directory, 'data', 'manifest-1694710246744', 'Prostate-MRI-US-Biopsy')
@@ -54,14 +55,26 @@ def generate_volume_triplets(volume):
     triplets = []
     
     for i in range(0, volume.shape[0] - 2, 2):
-        pre_slice = volume[i]      # shape (H, W)
-        mid_slice = volume[i + 1]  # shape (H, W)
-        post_slice = volume[i + 2] # shape (H, W)
+        pre = volume[i]      # shape (H, W)
+        mid = volume[i + 1]  # shape (H, W)
+        post = volume[i + 2] # shape (H, W)
+        
+        pre = torch.from_numpy(pre).float().unsqueeze(0)   # (1, H, W)
+        post = torch.from_numpy(post).float().unsqueeze(0) # (1, H, W)
+        mid = torch.from_numpy(mid).float().unsqueeze(0)
+        
+        target_size = (256, 256)
+        pre = TF.resize(pre, target_size, interpolation=TF.InterpolationMode.BILINEAR)
+        
+        post = TF.resize(post, target_size, interpolation=TF.InterpolationMode.BILINEAR)
+      
+        mid = TF.resize(mid, target_size, interpolation=TF.InterpolationMode.BILINEAR)
+       
         
         triplet = {
-            'pre': torch.from_numpy(pre_slice).float().unsqueeze(0),      # (1, H, W)
-            'post': torch.from_numpy(post_slice).float().unsqueeze(0),    # (1, H, W)
-            'middle': torch.from_numpy(mid_slice).float().unsqueeze(0),   # (1, H, W)
+            'pre': pre,      # (1, H, W)
+            'post': post,    # (1, H, W)
+            'middle': mid,   # (1, H, W)
             'index': i + 1  # Index of middle slice in original volume
         }
         triplets.append(triplet)
@@ -341,6 +354,12 @@ def predict_volume_and_visualize(seed=None, device='cuda', batch_size=8, save_pa
 
         with torch.no_grad():
             for pre_batch, post_batch, indices in batch_triplets_for_inference(triplets, batch_size=batch_size):
+                print(pre_batch.shape)
+                print(post_batch.shape)
+                pre_batch = pre_batch.unsqueeze(1)   # (4, 1, 256, 256)
+                post_batch = post_batch.unsqueeze(1) # (4, 1, 256, 256)
+                print(pre_batch.shape)
+                print(post_batch.shape)
                 pre_batch = pre_batch.to(device)
                 post_batch = post_batch.to(device)
             
@@ -409,6 +428,8 @@ def predict_volume_and_visualize(seed=None, device='cuda', batch_size=8, save_pa
             )
             
             plt.tight_layout()
+            pred_path = results_dir  + '/volume_visualization_all_except_ddpm.png'
+            plt.savefig(pred_path, dpi=150, bbox_inches='tight')
             plt.show()
     
     print(f"\n{'='*70}")

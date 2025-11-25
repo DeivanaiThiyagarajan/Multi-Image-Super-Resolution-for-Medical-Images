@@ -7,6 +7,7 @@ import torch
 import matplotlib.pyplot as plt
 from skimage.metrics import structural_similarity as ssim
 from skimage.metrics import peak_signal_noise_ratio as psnr
+import torchvision.transforms.functional as TF
 
 parent_directory = os.path.dirname(os.getcwd())
 BASE_DIR = os.path.join(parent_directory, 'data', 'manifest-1694710246744', 'Prostate-MRI-US-Biopsy')
@@ -54,14 +55,26 @@ def generate_volume_triplets(volume):
     triplets = []
     
     for i in range(0, volume.shape[0] - 2, 2):
-        pre_slice = volume[i]      # shape (H, W)
-        mid_slice = volume[i + 1]  # shape (H, W)
-        post_slice = volume[i + 2] # shape (H, W)
+        pre = volume[i]      # shape (H, W)
+        mid = volume[i + 1]  # shape (H, W)
+        post = volume[i + 2] # shape (H, W)
+        
+        pre = torch.from_numpy(pre).float().unsqueeze(0)   # (1, H, W)
+        post = torch.from_numpy(post).float().unsqueeze(0) # (1, H, W)
+        mid = torch.from_numpy(mid).float().unsqueeze(0)
+        
+        target_size = (256, 256)
+        pre = TF.resize(pre, target_size, interpolation=TF.InterpolationMode.BILINEAR)
+        
+        post = TF.resize(post, target_size, interpolation=TF.InterpolationMode.BILINEAR)
+      
+        mid = TF.resize(mid, target_size, interpolation=TF.InterpolationMode.BILINEAR)
+       
         
         triplet = {
-            'pre': torch.from_numpy(pre_slice).float().unsqueeze(0),      # (1, H, W)
-            'post': torch.from_numpy(post_slice).float().unsqueeze(0),    # (1, H, W)
-            'middle': torch.from_numpy(mid_slice).float().unsqueeze(0),   # (1, H, W)
+            'pre': pre,      # (1, H, W)
+            'post': post,    # (1, H, W)
+            'middle': mid,   # (1, H, W)
             'index': i + 1  # Index of middle slice in original volume
         }
         triplets.append(triplet)
@@ -150,9 +163,10 @@ def batch_triplets_for_inference(triplets, batch_size=32):
 def load_model(model_name, device='cuda'):
     """
     Load the best model checkpoint for the given model name.
+    Uses correct model architectures from ModelLoader.py
     
     Args:
-        model_name: Model identifier - 'unet', 'deepcnn', 'progressive_unet', 'unet_gan', 'fastddpm'
+        model_name: Model identifier - 'unet', 'deepcnn', 'progressive_unet', 'unet_gan'
         device: 'cuda' or 'cpu'
     
     Returns:
@@ -161,50 +175,8 @@ def load_model(model_name, device='cuda'):
     Raises:
         ValueError: If model_name not recognized or checkpoint not found
     """
-    parent_dir = os.path.dirname(os.getcwd())
-    models_dir = os.path.join(parent_dir, 'models')
-    
-    # Map model names to checkpoint filenames
-    checkpoint_map = {
-        'unet': 'unet_best.pt',
-        'deepcnn': 'deepcnn_best.pt',
-        'progressive_unet': 'progressive_unet_best.pt',
-        'unet_gan': 'unet_gan_generator_best.pt',
-        'fastddpm': 'fastddpm_best.pt'
-    }
-    
-    if model_name.lower() not in checkpoint_map:
-        raise ValueError(f"Unknown model: {model_name}. Choose from: {list(checkpoint_map.keys())}")
-    
-    checkpoint_file = os.path.join(models_dir, checkpoint_map[model_name.lower()])
-    
-    if not os.path.exists(checkpoint_file):
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_file}")
-    
-    # Import model architectures
-    if model_name.lower() == 'unet':
-        from unet_model import UNet
-        model = UNet(in_channels=2, out_channels=1).to(device)
-    elif model_name.lower() == 'deepcnn':
-        from unet_model import DeepCNN
-        model = DeepCNN(in_channels=2, out_channels=1).to(device)
-    elif model_name.lower() == 'progressive_unet':
-        from unet_model import ProgressiveUNet
-        model = ProgressiveUNet(in_channels=2, out_channels=3).to(device)
-    elif model_name.lower() == 'unet_gan':
-        from unet_model import UNet
-        model = UNet(in_channels=2, out_channels=1).to(device)
-    elif model_name.lower() == 'fastddpm':
-        # This would need FastDDPMUNet from FastDDPM notebook
-        raise NotImplementedError("FastDDPM requires DDPMScheduler - implement separately")
-    
-    # Load checkpoint
-    model.load_state_dict(torch.load(checkpoint_file, map_location=device))
-    model.eval()
-    
-    print(f"✓ Loaded {model_name} model from {checkpoint_file}")
-    
-    return model
+    from ModelLoader import load_model as loader_load_model
+    return loader_load_model(model_name, device=device)
 
 
 def compute_metrics(original, predicted):
@@ -382,6 +354,12 @@ def predict_volume_and_visualize(seed=None, device='cuda', batch_size=8, save_pa
 
         with torch.no_grad():
             for pre_batch, post_batch, indices in batch_triplets_for_inference(triplets, batch_size=batch_size):
+                print(pre_batch.shape)
+                print(post_batch.shape)
+                pre_batch = pre_batch.unsqueeze(1)   # (4, 1, 256, 256)
+                post_batch = post_batch.unsqueeze(1) # (4, 1, 256, 256)
+                print(pre_batch.shape)
+                print(post_batch.shape)
                 pre_batch = pre_batch.to(device)
                 post_batch = post_batch.to(device)
             
@@ -450,6 +428,8 @@ def predict_volume_and_visualize(seed=None, device='cuda', batch_size=8, save_pa
             )
             
             plt.tight_layout()
+            pred_path = results_dir  + '/volume_visualization_all_except_ddpm.png'
+            plt.savefig(pred_path, dpi=150, bbox_inches='tight')
             plt.show()
     
     print(f"\n{'='*70}")
