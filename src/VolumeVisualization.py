@@ -51,7 +51,7 @@ def load_patient_volume(series_folder_path):
 
 
 def generate_volume_triplets(volume):
-
+    """Generate triplets from volume for standard models (UNet, DeepCNN, UNet-GAN)"""
     triplets = []
     
     for i in range(0, volume.shape[0] - 2, 2):
@@ -80,6 +80,36 @@ def generate_volume_triplets(volume):
         triplets.append(triplet)
     
     return triplets
+
+
+def generate_progressive_5slice_windows(volume):
+    """Generate 5-slice windows for Progressive UNet from volume"""
+    windows = []
+    
+    # Generate 5-consecutive-slice windows
+    for i in range(volume.shape[0] - 4):
+        # Get 5 consecutive slices: i, i+1, i+2, i+3, i+4
+        window_5 = []
+        for j in range(5):
+            s = volume[i + j]  # shape (H, W)
+            # Z-score normalization per slice
+            s_normalized = (s - s.mean()) / (s.std() + 1e-6)
+            window_5.append(torch.from_numpy(s_normalized).float().unsqueeze(0))
+        
+        # Stack into (5, H, W)
+        window = torch.cat(window_5, dim=0)  # (5, H, W)
+        
+        # Resize to 256x256
+        target_size = (256, 256)
+        window = TF.resize(window, target_size, interpolation=TF.InterpolationMode.BILINEAR)
+        
+        window_dict = {
+            'window': window,  # (5, H, W)
+            'index': i + 2     # Index of middle slice (i+2 is the middle of 5 slices)
+        }
+        windows.append(window_dict)
+    
+    return windows
 
 
 def get_test_patient_folders():
@@ -158,6 +188,17 @@ def batch_triplets_for_inference(triplets, batch_size=32):
         indices = [t['index'] for t in batch]
         
         yield pre_batch, post_batch, indices
+
+
+def batch_progressive_windows_for_inference(windows, batch_size=32):
+    """Batch progressive UNet 5-slice windows for inference"""
+    for i in range(0, len(windows), batch_size):
+        batch = windows[i:i + batch_size]
+        
+        window_batch = torch.stack([w['window'] for w in batch], dim=0)  # (B, 5, H, W)
+        indices = [w['index'] for w in batch]
+        
+        yield window_batch, indices
 
 
 def load_model(model_name, device='cuda'):
@@ -327,11 +368,13 @@ def predict_volume_and_visualize(seed=None, device='cuda', batch_size=8, save_pa
 
     volume_original = data['volume']
     triplets = data['triplets']
+    progressive_windows = generate_progressive_5slice_windows(volume_original)
     patient_name = data['patient_name']
     
     print(f"   Patient: {patient_name}")
     print(f"   Volume shape: {volume_original.shape}")
     print(f"   Triplets: {len(triplets)}")
+    print(f"   Progressive 5-slice windows: {len(progressive_windows)}")
 
     # Run inference on all triplets
     print(f"\n2. Running inference with all models...")
@@ -353,37 +396,51 @@ def predict_volume_and_visualize(seed=None, device='cuda', batch_size=8, save_pa
         predictions_dict = {}
 
         with torch.no_grad():
-            for pre_batch, post_batch, indices in batch_triplets_for_inference(triplets, batch_size=batch_size):
-                print(pre_batch.shape)
-                print(post_batch.shape)
-                pre_batch = pre_batch.unsqueeze(1)   # (4, 1, 256, 256)
-                post_batch = post_batch.unsqueeze(1) # (4, 1, 256, 256)
-                print(pre_batch.shape)
-                print(post_batch.shape)
-                pre_batch = pre_batch.to(device)
-                post_batch = post_batch.to(device)
-            
-                # Stack pre and post as input
-                x_input = torch.cat([pre_batch, post_batch], dim=1)  # (B, 2, H, W)
-            
-                # Predict
-                predictions = model(x_input)  # Output shape depends on model
-            
-                # Handle different model output shapes
-                if model_name.lower() == 'progressive_unet':
-                    # Progressive UNet outputs 3 channels (3 predictions)
-                    pred_middle = predictions[:, 1:2, :, :]  # Take middle prediction
-                else:
-                    # UNet, DeepCNN, UNet-GAN output 1 channel
+            if model_name.lower() == 'progressive_unet':
+                # Progressive UNet uses 5-slice windows
+                for window_batch, indices in batch_progressive_windows_for_inference(progressive_windows, batch_size=batch_size):
+                    window_batch = window_batch.to(device)  # (B, 5, H, W)
+                    
+                    # Predict
+                    predictions = model(window_batch)  # (B, 3, H, W) - outputs 3 predictions
+                    
+                    # Progressive UNet outputs 3 slices: i+1, i+2, i+3
+                    # indices contain the middle slice index (i+2)
+                    pred_i1 = predictions[:, 0:1, :, :]  # (B, 1, H, W) - i+1
+                    pred_i2 = predictions[:, 1:2, :, :]  # (B, 1, H, W) - i+2
+                    pred_i3 = predictions[:, 2:3, :, :]  # (B, 1, H, W) - i+3
+                    
+                    # Store predictions indexed by slice index
+                    for idx, pred1, pred2, pred3 in zip(indices, pred_i1, pred_i2, pred_i3):
+                        # idx is the middle slice index (i+2)
+                        predictions_dict[idx - 1] = pred1.cpu().numpy()[0]  # i+1
+                        predictions_dict[idx] = pred2.cpu().numpy()[0]      # i+2
+                        predictions_dict[idx + 1] = pred3.cpu().numpy()[0]  # i+3
+            else:
+                # Standard models (UNet, DeepCNN, UNet-GAN) use triplets
+                for pre_batch, post_batch, indices in batch_triplets_for_inference(triplets, batch_size=batch_size):
+                    pre_batch = pre_batch.unsqueeze(1)   # (B, 1, 1, H, W) -> (B, 1, H, W) already correct
+                    post_batch = post_batch.unsqueeze(1) # Same
+                    pre_batch = pre_batch.to(device)
+                    post_batch = post_batch.to(device)
+                
+                    # Stack pre and post as input
+                    x_input = torch.cat([pre_batch, post_batch], dim=1)  # (B, 2, H, W)
+                
+                    # Predict
+                    predictions = model(x_input)  # Output shape depends on model
+                
+                    # Handle different model output shapes
                     pred_middle = predictions  # (B, 1, H, W)
-            
-                # Store predictions indexed by middle slice index
-                for idx, pred in zip(indices, pred_middle):
-                    predictions_dict[idx] = pred.cpu().numpy()[0]  # (H, W)
+                
+                    # Store predictions indexed by middle slice index
+                    for idx, pred in zip(indices, pred_middle):
+                        predictions_dict[idx] = pred.cpu().numpy()[0]  # (H, W)
     
         # Fill in predicted volume
         for idx, pred in predictions_dict.items():
-            volume_predicted[idx] = pred
+            if 0 <= idx < volume_predicted.shape[0]:
+                volume_predicted[idx] = pred
 
         all_models[model_name] = volume_predicted
         print(f"      ✓ {model_name.upper()} prediction complete")
