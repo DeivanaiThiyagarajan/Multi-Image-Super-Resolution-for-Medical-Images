@@ -28,6 +28,39 @@ class UNetBlock(nn.Module):
     
     def forward(self, x):
         return self.conv(x)
+    
+    
+class ProgressiveUNetBlock(nn.Module):
+    """Basic UNet encoder/decoder block with convolution and skip connection support"""
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
+        super(ProgressiveUNetBlock, self).__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=kernel_size, stride=1, padding=padding, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+    
+    def forward(self, x):
+        return self.conv(x)
+    
+class GANUNetBlock(nn.Module):
+    """Basic UNet encoder/decoder block"""
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
+        super(GANUNetBlock, self).__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=kernel_size, stride=1, padding=padding, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+    
+    def forward(self, x):
+        return self.conv(x)
 
 
 class UNet(nn.Module):
@@ -122,33 +155,33 @@ class UNetStage(nn.Module):
         super(UNetStage, self).__init__()
         
         # Encoder
-        self.enc1 = UNetBlock(in_channels, base_features)
+        self.enc1 = ProgressiveUNetBlock(in_channels, base_features)
         self.pool1 = nn.MaxPool2d(2, 2)
         
-        self.enc2 = UNetBlock(base_features, base_features * 2)
+        self.enc2 = ProgressiveUNetBlock(base_features, base_features * 2)
         self.pool2 = nn.MaxPool2d(2, 2)
         
-        self.enc3 = UNetBlock(base_features * 2, base_features * 4)
+        self.enc3 = ProgressiveUNetBlock(base_features * 2, base_features * 4)
         self.pool3 = nn.MaxPool2d(2, 2)
         
-        self.enc4 = UNetBlock(base_features * 4, base_features * 8)
+        self.enc4 = ProgressiveUNetBlock(base_features * 4, base_features * 8)
         self.pool4 = nn.MaxPool2d(2, 2)
         
         # Bottleneck
-        self.bottleneck = UNetBlock(base_features * 8, base_features * 16)
+        self.bottleneck = ProgressiveUNetBlock(base_features * 8, base_features * 16)
         
         # Decoder
         self.upconv4 = nn.ConvTranspose2d(base_features * 16, base_features * 8, kernel_size=2, stride=2)
-        self.dec4 = UNetBlock(base_features * 16, base_features * 8)
+        self.dec4 = ProgressiveUNetBlock(base_features * 16, base_features * 8)
         
         self.upconv3 = nn.ConvTranspose2d(base_features * 8, base_features * 4, kernel_size=2, stride=2)
-        self.dec3 = UNetBlock(base_features * 8, base_features * 4)
+        self.dec3 = ProgressiveUNetBlock(base_features * 8, base_features * 4)
         
         self.upconv2 = nn.ConvTranspose2d(base_features * 4, base_features * 2, kernel_size=2, stride=2)
-        self.dec2 = UNetBlock(base_features * 4, base_features * 2)
+        self.dec2 = ProgressiveUNetBlock(base_features * 4, base_features * 2)
         
         self.upconv1 = nn.ConvTranspose2d(base_features * 2, base_features, kernel_size=2, stride=2)
-        self.dec1 = UNetBlock(base_features * 2, base_features)
+        self.dec1 = ProgressiveUNetBlock(base_features * 2, base_features)
         
         # Final output
         self.final = nn.Conv2d(base_features, out_channels, kernel_size=1)
@@ -211,19 +244,7 @@ class ProgressiveUNet(nn.Module):
         self.unet3 = UNetStage(in_channels=2, out_channels=1, base_features=base_features)  # (i+2, i+4) -> i+3
     
     def forward(self, slices):
-        """
-        Input: slices of shape (B, 5, H, W)
-            - slices[:, 0] = i
-            - slices[:, 1] = i+1 (ground truth)
-            - slices[:, 2] = i+2 (ground truth)
-            - slices[:, 3] = i+3 (ground truth)
-            - slices[:, 4] = i+4
         
-        Returns:
-            - pred_i2: Predicted i+2
-            - pred_i1: Predicted i+1
-            - pred_i3: Predicted i+3
-        """
         batch_size = slices.shape[0]
         
         # Extract individual slices
@@ -371,33 +392,33 @@ class UNetGenerator(nn.Module):
         super(UNetGenerator, self).__init__()
         
         # Encoder
-        self.enc1 = UNetBlock(in_channels, base_features)
+        self.enc1 = GANUNetBlock(in_channels, base_features)
         self.pool1 = nn.MaxPool2d(2, 2)
         
-        self.enc2 = UNetBlock(base_features, base_features * 2)
+        self.enc2 = GANUNetBlock(base_features, base_features * 2)
         self.pool2 = nn.MaxPool2d(2, 2)
         
-        self.enc3 = UNetBlock(base_features * 2, base_features * 4)
+        self.enc3 = GANUNetBlock(base_features * 2, base_features * 4)
         self.pool3 = nn.MaxPool2d(2, 2)
         
-        self.enc4 = UNetBlock(base_features * 4, base_features * 8)
+        self.enc4 = GANUNetBlock(base_features * 4, base_features * 8)
         self.pool4 = nn.MaxPool2d(2, 2)
         
         # Bottleneck
-        self.bottleneck = UNetBlock(base_features * 8, base_features * 16)
+        self.bottleneck = GANUNetBlock(base_features * 8, base_features * 16)
         
         # Decoder
         self.upconv4 = nn.ConvTranspose2d(base_features * 16, base_features * 8, kernel_size=2, stride=2)
-        self.dec4 = UNetBlock(base_features * 16, base_features * 8)
+        self.dec4 = GANUNetBlock(base_features * 16, base_features * 8)
         
         self.upconv3 = nn.ConvTranspose2d(base_features * 8, base_features * 4, kernel_size=2, stride=2)
-        self.dec3 = UNetBlock(base_features * 8, base_features * 4)
+        self.dec3 = GANUNetBlock(base_features * 8, base_features * 4)
         
         self.upconv2 = nn.ConvTranspose2d(base_features * 4, base_features * 2, kernel_size=2, stride=2)
-        self.dec2 = UNetBlock(base_features * 4, base_features * 2)
+        self.dec2 = GANUNetBlock(base_features * 4, base_features * 2)
         
         self.upconv1 = nn.ConvTranspose2d(base_features * 2, base_features, kernel_size=2, stride=2)
-        self.dec1 = UNetBlock(base_features * 2, base_features)
+        self.dec1 = GANUNetBlock(base_features * 2, base_features)
         
         # Final output
         self.final = nn.Conv2d(base_features, out_channels, kernel_size=1)
@@ -468,8 +489,8 @@ def load_model(model_name, device='cuda'):
     checkpoint_map = {
         'unet': ('unet_best.pt', UNet, {'in_channels': 2, 'out_channels': 1, 'init_features': 64}),
         'deepcnn': ('deepcnn_best.pt', DeepCNN, {'in_channels': 2, 'out_channels': 1, 'num_blocks': [2, 2, 2, 2], 'base_features': 64}),
-        'progressive_unet': ('progressive_unet_best.pt', ProgressiveUNet, {'in_channels': 2, 'out_channels': 3, 'init_features': 64}),
-        'unet_gan': ('unet_gan_generator_best.pt', UNetGenerator, {'in_channels': 2, 'out_channels': 1, 'init_features': 64}),
+        'progressive_unet': ('progressive_unet_best.pt', ProgressiveUNet, {'base_features': 64}),
+        'unet_gan': ('unet_gan_best.pt', UNetGenerator, {'in_channels': 2, 'out_channels': 1, 'base_features': 64}),
     }
     
     model_name_lower = model_name.lower()
@@ -486,7 +507,10 @@ def load_model(model_name, device='cuda'):
     # Initialize and load model
     model = model_class(**init_kwargs).to(device)
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    if(model_name_lower == 'unet_gan'):
+        model.load_state_dict(checkpoint['generator_state_dict'])
+    else:
+        model.load_state_dict(checkpoint['model_state_dict'])
     
     #model.load_state_dict(torch.load(checkpoint_path, map_location=device))
     model.eval()

@@ -282,7 +282,7 @@ def visualize_all_models_parallel(all_models, volume_original, patient_name, see
     model_names = ['Original'] + list(all_models.keys())
     
     # 2 views per model (sagittal and axial)
-    fig = plt.figure(figsize=(22, 5 * num_models))
+    fig = plt.figure(figsize=(16, 5 * num_models))
     
     # Select slice indices for visualization
     sagittal_x = 128  # Middle X position for sagittal view
@@ -402,13 +402,7 @@ def predict_volume_and_visualize(seed=None, device='cuda', batch_size=8, save_pa
                     window_batch = window_batch.to(device)  # (B, 5, H, W)
                     
                     # Predict
-                    predictions = model(window_batch)  # (B, 3, H, W) - outputs 3 predictions
-                    
-                    # Progressive UNet outputs 3 slices: i+1, i+2, i+3
-                    # indices contain the middle slice index (i+2)
-                    pred_i1 = predictions[:, 0:1, :, :]  # (B, 1, H, W) - i+1
-                    pred_i2 = predictions[:, 1:2, :, :]  # (B, 1, H, W) - i+2
-                    pred_i3 = predictions[:, 2:3, :, :]  # (B, 1, H, W) - i+3
+                    pred_i1, pred_i2, pred_i3 = model(window_batch)  # (B, 3, H, W) - outputs 3 predictions
                     
                     # Store predictions indexed by slice index
                     for idx, pred1, pred2, pred3 in zip(indices, pred_i1, pred_i2, pred_i3):
