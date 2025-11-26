@@ -281,8 +281,8 @@ def visualize_all_models_parallel(all_models, volume_original, patient_name, see
     num_models = len(all_models) + 1  # +1 for original
     model_names = ['Original'] + list(all_models.keys())
     
-    # 2 views per model (sagittal and axial)
-    fig = plt.figure(figsize=(16, 5 * num_models))
+    # 3 views per model (sagittal, axial, difference)
+    fig = plt.figure(figsize=(20, 6 * num_models))
     
     # Select slice indices for visualization
     sagittal_x = 128  # Middle X position for sagittal view
@@ -297,13 +297,13 @@ def visualize_all_models_parallel(all_models, volume_original, patient_name, see
             metrics = metrics_dict[model_name]
         
         # ===== SAGITTAL VIEW (Y-Z plane at x=sagittal_x) =====
-        ax_sag = plt.subplot(num_models, 2, row * 2 + 1)
+        ax_sag = plt.subplot(num_models, 3, row * 3 + 1)
         
         sagittal_view = volume_to_show[:, sagittal_x, :]
         im_sag = ax_sag.imshow(sagittal_view.T, cmap='gray', aspect='auto', origin='lower')
         
         if model_name == 'Original':
-            ax_sag.set_title(f'Sagittal View (X={sagittal_x})', fontsize=12, fontweight='bold', color='black')
+            ax_sag.set_title(f'Sagittal View (X={sagittal_x})', fontsize=12, fontweight='bold', color='darkgreen')
         else:
             title = f'{model_name.upper()} - Sagittal\nSSIM: {metrics["ssim_mean"]:.4f} | PSNR: {metrics["psnr_mean"]:.2f}'
             ax_sag.set_title(title, fontsize=11, fontweight='bold', color='darkblue')
@@ -314,13 +314,13 @@ def visualize_all_models_parallel(all_models, volume_original, patient_name, see
         cbar_sag.set_label('Intensity', fontsize=9)
         
         # ===== AXIAL VIEW (X-Y plane at z=axial_z) =====
-        ax_ax = plt.subplot(num_models, 2, row * 2 + 2)
+        ax_ax = plt.subplot(num_models, 3, row * 3 + 2)
         
         axial_view = volume_to_show[axial_z, :, :]
         im_ax = ax_ax.imshow(axial_view, cmap='gray', aspect='auto', origin='lower')
         
         if model_name == 'Original':
-            ax_ax.set_title(f'Axial View (Z={axial_z})', fontsize=12, fontweight='bold', color='black')
+            ax_ax.set_title(f'Axial View (Z={axial_z})', fontsize=12, fontweight='bold', color='darkgreen')
         else:
             title = f'{model_name.upper()} - Axial\nMAE: {metrics["mae"]:.4f}'
             ax_ax.set_title(title, fontsize=11, fontweight='bold', color='darkgreen')
@@ -329,9 +329,30 @@ def visualize_all_models_parallel(all_models, volume_original, patient_name, see
         ax_ax.set_ylabel('Y Position', fontsize=10)
         cbar_ax = plt.colorbar(im_ax, ax=ax_ax, fraction=0.046, pad=0.04)
         cbar_ax.set_label('Intensity', fontsize=9)
+        
+        # ===== DIFFERENCE MAP (only for predictions, not original) =====
+        ax_diff = plt.subplot(num_models, 3, row * 3 + 3)
+        
+        if model_name == 'Original':
+            # For original, show sagittal view again (no difference)
+            diff_view = sagittal_view.T
+            im_diff = ax_diff.imshow(diff_view, cmap='gray', aspect='auto', origin='lower')
+            ax_diff.set_title(f'Sagittal Repeat (X={sagittal_x})', fontsize=12, fontweight='bold', color='darkgreen')
+        else:
+            # Show difference map
+            sagittal_orig = orig_norm[:, sagittal_x, :]
+            sagittal_pred = volume_to_show[:, sagittal_x, :]
+            diff = np.abs(sagittal_orig - sagittal_pred)
+            im_diff = ax_diff.imshow(diff.T, cmap='hot', aspect='auto', origin='lower')
+            ax_diff.set_title(f'{model_name.upper()} - Difference\nMax Error: {np.max(diff):.4f}', fontsize=11, fontweight='bold', color='darkred')
+        
+        ax_diff.set_xlabel('Slice Index (Z)', fontsize=10)
+        ax_diff.set_ylabel('Y Position', fontsize=10)
+        cbar_diff = plt.colorbar(im_diff, ax=ax_diff, fraction=0.046, pad=0.04)
+        cbar_diff.set_label('Error' if model_name != 'Original' else 'Intensity', fontsize=9)
     
     # Overall title
-    title_str = f'Multi-Model Comparison - Sagittal & Axial Views\nPatient: {patient_name} (Seed: {seed})'
+    title_str = f'Multi-Model Comparison - Sagittal, Axial & Difference Maps\nPatient: {patient_name} (Seed: {seed})'
     fig.suptitle(title_str, fontsize=15, fontweight='bold', y=0.995)
     
     plt.tight_layout(rect=[0, 0, 1, 0.99])
@@ -445,35 +466,46 @@ def predict_volume_and_visualize(seed=None, device='cuda', batch_size=8, save_pa
     else:
         # Show individual model visualization (legacy)
         print(f"\n3. Generating individual model visualizations...")
+        
+        # Normalize original volume once
+        orig_norm = (volume_original - volume_original.min()) / (volume_original.max() - volume_original.min() + 1e-8)
+        
         for model_name, volume_pred in all_models.items():
             metrics = compute_metrics(volume_original, volume_pred)
             
-            # Visualization code for single model
-            fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+            # Visualization code for single model with original volume
+            fig, axes = plt.subplots(3, 3, figsize=(15, 14))
             
             x_positions = [64, 128, 192]
-            orig_norm = metrics['orig_norm']
             pred_norm = metrics['pred_norm']
             
             for col, x_pos in enumerate(x_positions):
-                # Original sagittal
+                # Original sagittal (top row)
                 orig_sagittal = orig_norm[:, x_pos, :]
                 im0 = axes[0, col].imshow(orig_sagittal.T, cmap='gray', aspect='auto')
-                axes[0, col].set_title(f'Original Sagittal (X={x_pos})', fontsize=11, fontweight='bold')
+                axes[0, col].set_title(f'Original Sagittal (X={x_pos})', fontsize=11, fontweight='bold', color='darkgreen')
                 axes[0, col].set_xlabel('Slice Index (Z)')
                 axes[0, col].set_ylabel('Y Position')
                 plt.colorbar(im0, ax=axes[0, col], fraction=0.046)
                 
-                # Predicted sagittal
+                # Predicted sagittal (middle row)
                 pred_sagittal = pred_norm[:, x_pos, :]
                 im1 = axes[1, col].imshow(pred_sagittal.T, cmap='gray', aspect='auto')
-                axes[1, col].set_title(f'{model_name.upper()} Sagittal (X={x_pos})', fontsize=11, fontweight='bold')
+                axes[1, col].set_title(f'{model_name.upper()} Sagittal (X={x_pos})', fontsize=11, fontweight='bold', color='darkblue')
                 axes[1, col].set_xlabel('Slice Index (Z)')
                 axes[1, col].set_ylabel('Y Position')
                 plt.colorbar(im1, ax=axes[1, col], fraction=0.046)
+                
+                # Difference map (bottom row)
+                diff = np.abs(orig_sagittal - pred_sagittal)
+                im2 = axes[2, col].imshow(diff.T, cmap='hot', aspect='auto')
+                axes[2, col].set_title(f'Difference (X={x_pos})', fontsize=11, fontweight='bold', color='darkred')
+                axes[2, col].set_xlabel('Slice Index (Z)')
+                axes[2, col].set_ylabel('Y Position')
+                plt.colorbar(im2, ax=axes[2, col], fraction=0.046)
             
             fig.suptitle(
-                f'{model_name.upper()} - Volume Prediction & Sagittal Comparison\n'
+                f'{model_name.upper()} - Volume Prediction Comparison\n'
                 f'Patient: {patient_name} | SSIM: {metrics["ssim_mean"]:.4f} | PSNR: {metrics["psnr_mean"]:.2f} dB | MAE: {metrics["mae"]:.4f}',
                 fontsize=13, fontweight='bold'
             )
