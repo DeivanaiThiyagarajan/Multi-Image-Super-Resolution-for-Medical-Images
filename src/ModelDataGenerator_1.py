@@ -9,7 +9,7 @@ from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms.functional as TF
 
 parent_directory = os.path.dirname(os.getcwd())
-BASE_DIR = os.path.join(parent_directory, 'data','manifest-1694710246744_1','Prostate-MRI-US-Biopsy')
+BASE_DIR = os.path.join(parent_directory, 'data','manifest-1694710246744','Prostate-MRI-US-Biopsy')
 
 
 def load_correct_study(patient_path):
@@ -112,21 +112,17 @@ class PairedTransforms:
             post = TF.vflip(post)
             mid  = TF.vflip(mid)
 
-        # Rotation (use bilinear!)
-        angle = random.uniform(-5, 5)
-        pre  = TF.rotate(pre, angle, interpolation=TF.InterpolationMode.BILINEAR)
-        post = TF.rotate(post, angle, interpolation=TF.InterpolationMode.BILINEAR)
-        mid  = TF.rotate(mid, angle, interpolation=TF.InterpolationMode.BILINEAR)
-
         return {"pre": pre, "post": post, "target": mid}
     
 
 class TripletSliceDataset(Dataset):
-    def __init__(self, patient_folders, transform=None):
+    def __init__(self, patient_folders, transform=None, cache_volumes=True):
         self.transform = transform
         self.patient_folders = patient_folders
         self.triplet_indices = []  # Stores (patient_idx, series_idx, triplet_idx)
         self.patient_series_map = {}  # Maps patient_idx to list of series paths
+        self.volume_cache = {}  # Cache loaded volumes: (pid, series_idx) -> volume
+        self.cache_volumes = cache_volumes
         
         # Build map of patient -> list of series folders (lazy discovery)
         for pid, folder in enumerate(patient_folders):
@@ -150,6 +146,18 @@ class TripletSliceDataset(Dataset):
                 
                 for t in range(n_total_triplets):
                     self.triplet_indices.append((pid, series_idx, t))
+        
+        # Pre-load all volumes into RAM cache (speeds up training significantly)
+        if self.cache_volumes:
+            print("💾 Pre-caching volumes into RAM for faster data loading...")
+            for pid, series_list in self.patient_series_map.items():
+                for series_idx, series_folder in enumerate(series_list):
+                    cache_key = (pid, series_idx)
+                    if cache_key not in self.volume_cache:
+                        volume = load_patient_volume(series_folder)
+                        if volume is not None:
+                            self.volume_cache[cache_key] = volume
+            print(f"✅ Cached {len(self.volume_cache)} volumes in RAM")
 
     def __len__(self):
         return len(self.triplet_indices)
@@ -157,13 +165,20 @@ class TripletSliceDataset(Dataset):
     def __getitem__(self, idx):
         patient_idx, series_idx, triplet_idx = self.triplet_indices[idx]
         
-        # Get the specific series folder for this patient
-        series_folder = self.patient_series_map[patient_idx][series_idx]
+        cache_key = (patient_idx, series_idx)
         
-        # Load volume only when needed (lazy loading)
-        vol = load_patient_volume(series_folder)
-        if vol is None:
-            raise ValueError(f"Failed to load volume from {series_folder}")
+        # Use cached volume if available, otherwise load and cache it
+        if cache_key in self.volume_cache:
+            vol = self.volume_cache[cache_key]
+        else:
+            # Fallback: load from disk if not cached
+            series_folder = self.patient_series_map[patient_idx][series_idx]
+            vol = load_patient_volume(series_folder)
+            if vol is None:
+                raise ValueError(f"Failed to load volume from {series_folder}")
+            # Cache it for next time
+            if self.cache_volumes:
+                self.volume_cache[cache_key] = vol
         
         # Generate triplets on-the-fly
         pre_list, post_list, mid_list = generate_consecutive_triplets(vol)
@@ -229,7 +244,7 @@ def build_dataloader(split="train",
 
     transform = PairedTransforms() if augment else None
 
-    dataset = TripletSliceDataset(patient_folders, transform)
+    dataset = TripletSliceDataset(patient_folders, transform, cache_volumes=True)
 
     # ---------------------------------------------------------
     # Build DataLoader
