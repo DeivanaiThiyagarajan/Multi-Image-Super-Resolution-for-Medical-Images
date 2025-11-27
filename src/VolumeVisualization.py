@@ -401,7 +401,7 @@ def predict_volume_and_visualize(seed=None, device='cuda', batch_size=8, save_pa
     print(f"\n2. Running inference with all models...")
     
     all_models = {}
-    model_list = ['unet', 'deepcnn', 'progressive_unet', 'unet_gan']
+    model_list = ['unet', 'unet_combined', 'deepcnn', 'progressive_unet', 'unet_gan']
     
     for model_name in model_list:
         print(f"\n   ⏳ Processing {model_name.upper()}...")

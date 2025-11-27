@@ -488,6 +488,7 @@ def load_model(model_name, device='cuda'):
     # Map model names to (checkpoint filename, model class, init kwargs)
     checkpoint_map = {
         'unet': ('unet_best.pt', UNet, {'in_channels': 2, 'out_channels': 1, 'init_features': 64}),
+        'unet_combined': ('unet_combined_best.pt', UNet, {'in_channels': 2, 'out_channels': 1, 'init_features': 64}),
         'deepcnn': ('deepcnn_best.pt', DeepCNN, {'in_channels': 2, 'out_channels': 1, 'num_blocks': [2, 2, 2, 2], 'base_features': 64}),
         'progressive_unet': ('progressive_unet_best.pt', ProgressiveUNet, {'base_features': 64}),
         'unet_gan': ('unet_gan_best.pt', UNetGenerator, {'in_channels': 2, 'out_channels': 1, 'base_features': 64}),

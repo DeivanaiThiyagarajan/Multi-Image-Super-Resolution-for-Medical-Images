@@ -9,7 +9,7 @@ from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms.functional as TF
 
 parent_directory = os.path.dirname(os.getcwd())
-BASE_DIR = os.path.join(parent_directory, 'data','manifest-1694710246744','Prostate-MRI-US-Biopsy')
+BASE_DIR = os.path.join(parent_directory, 'data','manifest-1694710246744_1','Prostate-MRI-US-Biopsy')
 
 
 def load_correct_study(patient_path):
