@@ -183,8 +183,18 @@ def batch_triplets_for_inference(triplets, batch_size=32):
     for i in range(0, len(triplets), batch_size):
         batch = triplets[i:i + batch_size]
         
-        pre_batch = torch.cat([t['pre'] for t in batch], dim=0)      # (B, 1, H, W)
-        post_batch = torch.cat([t['post'] for t in batch], dim=0)    # (B, 1, H, W)
+        # Concatenate slices: each slice is (1, H, W), so cat on dim=0 gives (N, H, W)
+        # Then unsqueeze to get (N, 1, H, W) for proper batch format
+        pre_list = [t['pre'] for t in batch]  # List of (1, H, W)
+        post_list = [t['post'] for t in batch]  # List of (1, H, W)
+        
+        pre_batch = torch.cat(pre_list, dim=0)  # (B, H, W)
+        post_batch = torch.cat(post_list, dim=0)  # (B, H, W)
+        
+        # Add channel dimension: (B, H, W) -> (B, 1, H, W)
+        pre_batch = pre_batch.unsqueeze(1)  # (B, 1, H, W)
+        post_batch = post_batch.unsqueeze(1)  # (B, 1, H, W)
+        
         indices = [t['index'] for t in batch]
         
         yield pre_batch, post_batch, indices
@@ -288,6 +298,20 @@ def visualize_all_models_parallel(all_models, volume_original, patient_name, see
     sagittal_x = 128  # Middle X position for sagittal view
     axial_z = 30      # Middle Z position for axial view
     
+    # Compute global intensity range for all models (for consistent colormapping)
+    all_volumes = [orig_norm] + [metrics_dict[model_name]['pred_norm'] for model_name in list(all_models.keys())]
+    global_vmin = min([v.min() for v in all_volumes])
+    global_vmax = max([v.max() for v in all_volumes])
+    
+    # Compute global max error across all models for difference maps
+    max_errors = []
+    for model_name in all_models.keys():
+        sagittal_orig = orig_norm[:, sagittal_x, :]
+        sagittal_pred = metrics_dict[model_name]['pred_norm'][:, sagittal_x, :]
+        diff = np.abs(sagittal_orig - sagittal_pred)
+        max_errors.append(np.max(diff))
+    global_max_error = max(max_errors) if max_errors else 0.1
+    
     for row, (model_idx, model_name) in enumerate(enumerate(model_names)):
         if model_name == 'Original':
             volume_to_show = orig_norm
@@ -300,7 +324,7 @@ def visualize_all_models_parallel(all_models, volume_original, patient_name, see
         ax_sag = plt.subplot(num_models, 3, row * 3 + 1)
         
         sagittal_view = volume_to_show[:, sagittal_x, :]
-        im_sag = ax_sag.imshow(sagittal_view.T, cmap='gray', aspect='auto', origin='lower')
+        im_sag = ax_sag.imshow(sagittal_view.T, cmap='gray', aspect='auto', origin='lower', vmin=global_vmin, vmax=global_vmax)
         
         if model_name == 'Original':
             ax_sag.set_title(f'Sagittal View (X={sagittal_x})', fontsize=12, fontweight='bold', color='darkgreen')
@@ -317,7 +341,7 @@ def visualize_all_models_parallel(all_models, volume_original, patient_name, see
         ax_ax = plt.subplot(num_models, 3, row * 3 + 2)
         
         axial_view = volume_to_show[axial_z, :, :]
-        im_ax = ax_ax.imshow(axial_view, cmap='gray', aspect='auto', origin='lower')
+        im_ax = ax_ax.imshow(axial_view, cmap='gray', aspect='auto', origin='lower', vmin=global_vmin, vmax=global_vmax)
         
         if model_name == 'Original':
             ax_ax.set_title(f'Axial View (Z={axial_z})', fontsize=12, fontweight='bold', color='darkgreen')
@@ -336,14 +360,14 @@ def visualize_all_models_parallel(all_models, volume_original, patient_name, see
         if model_name == 'Original':
             # For original, show sagittal view again (no difference)
             diff_view = sagittal_view.T
-            im_diff = ax_diff.imshow(diff_view, cmap='gray', aspect='auto', origin='lower')
+            im_diff = ax_diff.imshow(diff_view, cmap='gray', aspect='auto', origin='lower', vmin=global_vmin, vmax=global_vmax)
             ax_diff.set_title(f'Sagittal Repeat (X={sagittal_x})', fontsize=12, fontweight='bold', color='darkgreen')
         else:
-            # Show difference map
+            # Show difference map with consistent scale
             sagittal_orig = orig_norm[:, sagittal_x, :]
             sagittal_pred = volume_to_show[:, sagittal_x, :]
             diff = np.abs(sagittal_orig - sagittal_pred)
-            im_diff = ax_diff.imshow(diff.T, cmap='hot', aspect='auto', origin='lower')
+            im_diff = ax_diff.imshow(diff.T, cmap='hot', aspect='auto', origin='lower', vmin=0, vmax=global_max_error)
             ax_diff.set_title(f'{model_name.upper()} - Difference\nMax Error: {np.max(diff):.4f}', fontsize=11, fontweight='bold', color='darkred')
         
         ax_diff.set_xlabel('Slice Index (Z)', fontsize=10)
@@ -366,6 +390,485 @@ def visualize_all_models_parallel(all_models, volume_original, patient_name, see
     plt.show()
     
     return metrics_dict
+
+
+def generate_hierarchical_4slice_pairs(volume):
+    """
+    Generate hierarchical 4-slice pairs (i, i+4) for recursive interpolation.
+    
+    Strategy:
+    1. Input (i, i+4) → Predict i+2 (middle slice)
+    2. Input (i, predicted i+2) → Predict i+1 (left quarter)
+    3. Input (predicted i+2, i+4) → Predict i+3 (right quarter)
+    
+    Returns:
+        list of dict with keys:
+        - 'slice_i': tensor (1, H, W)
+        - 'slice_i_plus_4': tensor (1, H, W)
+        - 'indices': tuple (i, i+1, i+2, i+3, i+4)
+    """
+    pairs = []
+    target_size = (256, 256)
+    
+    for i in range(volume.shape[0] - 4):
+        # Get 5 slices
+        slices_raw = [volume[i + j] for j in range(5)]
+        
+        # Normalize and resize each slice
+        slices_processed = []
+        for s in slices_raw:
+            s_norm = (s - s.mean()) / (s.std() + 1e-6)
+            s_tensor = torch.from_numpy(s_norm).float().unsqueeze(0)  # (1, H, W)
+            s_resized = TF.resize(s_tensor, target_size, interpolation=TF.InterpolationMode.BILINEAR)
+            slices_processed.append(s_resized)
+        
+        pair = {
+            'slice_i': slices_processed[0],              # i
+            'slice_i_plus_4': slices_processed[4],       # i+4
+            'indices': (i, i+1, i+2, i+3, i+4)
+        }
+        pairs.append(pair)
+    
+    return pairs
+
+
+def batch_hierarchical_pairs_for_inference(pairs, batch_size=32):
+    """Batch hierarchical 4-slice pairs for inference"""
+    for b in range(0, len(pairs), batch_size):
+        batch = pairs[b:b + batch_size]
+        
+        # Concatenate slices: each slice is (1, H, W), so cat on dim=0 gives (N, H, W)
+        # Then unsqueeze to get (N, 1, H, W) for proper batch format
+        slice_i_list = [p['slice_i'] for p in batch]  # List of (1, H, W)
+        slice_i4_list = [p['slice_i_plus_4'] for p in batch]  # List of (1, H, W)
+        
+        slice_i_batch = torch.cat(slice_i_list, dim=0)  # (B, H, W)
+        slice_i4_batch = torch.cat(slice_i4_list, dim=0)  # (B, H, W)
+        
+        # Add channel dimension: (B, H, W) -> (B, 1, H, W)
+        slice_i_batch = slice_i_batch.unsqueeze(1)  # (B, 1, H, W)
+        slice_i4_batch = slice_i4_batch.unsqueeze(1)  # (B, 1, H, W)
+        
+        indices_batch = [p['indices'] for p in batch]
+        
+        yield slice_i_batch, slice_i4_batch, indices_batch
+
+
+def predict_volume_hierarchical(model_name, seed=None, device='cuda', batch_size=8, save_path=None):
+    """
+    Hierarchical prediction using existing trained models:
+    Stage 1: (i, i+4) → Predict i+2
+    Stage 2: (i, predicted i+2) → Predict i+1
+    Stage 3: (predicted i+2, i+4) → Predict i+3
+    
+    Args:
+        model_name: Which trained model to use ('unet', 'deepcnn', 'unet_gan', etc.)
+        seed: Random seed for reproducibility
+        device: 'cuda' or 'cpu'
+        batch_size: Batch size for inference
+        save_path: Path to save visualization
+    
+    Returns:
+        dict with volume predictions and metrics
+    """
+    
+    print(f"\n{'='*70}")
+    print(f"HIERARCHICAL 4-SLICE RECONSTRUCTION - {model_name.upper()}")
+    print(f"{'='*70}")
+    
+    print(f"\n1. Loading random patient...")
+    data = get_patient_volume_and_triplets(seed=seed)
+    volume_original = data['volume']
+    patient_name = data['patient_name']
+    
+    print(f"   Patient: {patient_name}")
+    print(f"   Volume shape: {volume_original.shape}")
+    
+    print(f"\n2. Generating hierarchical 4-slice pairs...")
+    hierarchical_pairs = generate_hierarchical_4slice_pairs(volume_original)
+    print(f"   ✓ Generated {len(hierarchical_pairs)} pairs")
+    
+    print(f"\n3. Loading model: {model_name.upper()}...")
+    try:
+        model = load_model(model_name, device=device)
+    except (FileNotFoundError, NotImplementedError) as e:
+        print(f"   ❌ Error: {str(e)}")
+        return None
+    
+    # Create predicted volume
+    volume_predicted = volume_original.copy()
+    predictions_stage1 = {}  # i+2
+    predictions_stage2 = {}  # i+1
+    predictions_stage3 = {}  # i+3
+    
+    print(f"\n4. Running hierarchical inference (3 stages)...")
+    
+    # STAGE 1: (i, i+4) → Predict i+2
+    print(f"\n   STAGE 1: (i, i+4) → Predict i+2 (middle slice)")
+    with torch.no_grad():
+        for slice_i, slice_i4, indices_batch in batch_hierarchical_pairs_for_inference(hierarchical_pairs, batch_size=batch_size):
+            slice_i = slice_i.to(device)
+            slice_i4 = slice_i4.to(device)
+            
+            # Concatenate as (B, 2, H, W) - standard model input format
+            x_input = torch.cat([slice_i, slice_i4], dim=1)
+            
+            # Model predicts middle slice
+            pred_i2 = model(x_input)  # (B, 1, H, W)
+            
+            # Store predictions
+            for idx_tuple, pred in zip(indices_batch, pred_i2):
+                predictions_stage1[idx_tuple[2]] = pred.cpu().numpy()[0]  # i+2
+    
+    print(f"   ✓ Stage 1 complete - predicted {len(predictions_stage1)} slices")
+    
+    # STAGE 2: (i, predicted i+2) → Predict i+1
+    print(f"\n   STAGE 2: (i, predicted i+2) → Predict i+1 (left quarter)")
+    with torch.no_grad():
+        for slice_i, slice_i4, indices_batch in batch_hierarchical_pairs_for_inference(hierarchical_pairs, batch_size=batch_size):
+            slice_i = slice_i.to(device)
+            
+            # Get predicted i+2 from stage 1
+            pred_i2_list = []
+            for idx_tuple in indices_batch:
+                if idx_tuple[2] in predictions_stage1:
+                    pred_i2 = predictions_stage1[idx_tuple[2]]  # (H, W)
+                else:
+                    pred_i2 = np.zeros((256, 256))
+                pred_i2_list.append(torch.from_numpy(pred_i2).float().unsqueeze(0))  # (1, H, W)
+            
+            slice_i2 = torch.cat(pred_i2_list, dim=0).unsqueeze(1).to(device)  # (B, H, W) -> (B, 1, H, W)
+            
+            # Input: (i, i+2)
+            x_input = torch.cat([slice_i, slice_i2], dim=1)  # (B, 2, H, W)
+            
+            # Predict i+1
+            pred_i1 = model(x_input)  # (B, 1, H, W)
+            
+            # Store predictions
+            for idx_tuple, pred in zip(indices_batch, pred_i1):
+                predictions_stage2[idx_tuple[1]] = pred.cpu().numpy()[0]  # i+1
+    
+    print(f"   ✓ Stage 2 complete - predicted {len(predictions_stage2)} slices")
+    
+    # STAGE 3: (predicted i+2, i+4) → Predict i+3
+    print(f"\n   STAGE 3: (predicted i+2, i+4) → Predict i+3 (right quarter)")
+    with torch.no_grad():
+        for slice_i, slice_i4, indices_batch in batch_hierarchical_pairs_for_inference(hierarchical_pairs, batch_size=batch_size):
+            slice_i4 = slice_i4.to(device)
+            
+            # Get predicted i+2 from stage 1
+            pred_i2_list = []
+            for idx_tuple in indices_batch:
+                if idx_tuple[2] in predictions_stage1:
+                    pred_i2 = predictions_stage1[idx_tuple[2]]  # (H, W)
+                else:
+                    pred_i2 = np.zeros((256, 256))
+                pred_i2_list.append(torch.from_numpy(pred_i2).float().unsqueeze(0))  # (1, H, W)
+            
+            slice_i2 = torch.cat(pred_i2_list, dim=0).unsqueeze(1).to(device)  # (B, H, W) -> (B, 1, H, W)
+            
+            # Input: (i+2, i+4)
+            x_input = torch.cat([slice_i2, slice_i4], dim=1)  # (B, 2, H, W)
+            
+            # Predict i+3
+            pred_i3 = model(x_input)  # (B, 1, H, W)
+            
+            # Store predictions
+            for idx_tuple, pred in zip(indices_batch, pred_i3):
+                predictions_stage3[idx_tuple[3]] = pred.cpu().numpy()[0]  # i+3
+    
+    print(f"   ✓ Stage 3 complete - predicted {len(predictions_stage3)} slices")
+    
+    # Fill volume
+    print(f"\n5. Assembling predicted volume...")
+    all_predictions = {**predictions_stage1, **predictions_stage2, **predictions_stage3}
+    for idx, pred in all_predictions.items():
+        if 0 <= idx < volume_predicted.shape[0]:
+            volume_predicted[idx] = pred
+    
+    print(f"   ✓ Filled {len(all_predictions)} slices")
+    
+    # Compute metrics
+    metrics = compute_metrics(volume_original, volume_predicted)
+    
+    print(f"\n📊 Metrics:")
+    print(f"   SSIM: {metrics['ssim_mean']:.4f} ± {metrics['ssim_std']:.3f}")
+    print(f"   PSNR: {metrics['psnr_mean']:.2f} ± {metrics['psnr_std']:.2f} dB")
+    print(f"   MAE:  {metrics['mae']:.4f}")
+    
+    print(f"\n{'='*70}")
+    print(f"✅ HIERARCHICAL RECONSTRUCTION COMPLETE!")
+    print(f"{'='*70}\n")
+    
+    return {
+        'volume_original': volume_original,
+        'volume_predicted': volume_predicted,
+        'patient_name': patient_name,
+        'metrics': metrics
+    }
+
+
+def predict_volume_hierarchical_all_models(seed=None, device='cuda', batch_size=8, save_path=None):
+    """
+    Predict volumes using hierarchical 4-slice method with all models in parallel.
+    Shows all model outputs side-by-side with sagittal, axial, and difference maps.
+    
+    Args:
+        seed: Random seed for reproducibility
+        device: 'cuda' or 'cpu'
+        batch_size: Batch size for inference
+        save_path: Path to save the final visualization
+    """
+    
+    print(f"\n{'='*70}")
+    print(f"HIERARCHICAL 4-SLICE RECONSTRUCTION - ALL MODELS")
+    print(f"{'='*70}")
+    
+    print(f"\n1. Loading random patient...")
+    data = get_patient_volume_and_triplets(seed=seed)
+    volume_original = data['volume']
+    patient_name = data['patient_name']
+    
+    print(f"   Patient: {patient_name}")
+    print(f"   Volume shape: {volume_original.shape}")
+    
+    print(f"\n2. Generating hierarchical 4-slice pairs...")
+    hierarchical_pairs = generate_hierarchical_4slice_pairs(volume_original)
+    print(f"   ✓ Generated {len(hierarchical_pairs)} pairs")
+    
+    # Run inference for all models
+    print(f"\n3. Running hierarchical inference with all models...")
+    
+    all_models = {}
+    model_list = ['unet', 'deepcnn', 'unet_gan']
+    
+    for model_name in model_list:
+        print(f"\n   ⏳ Processing {model_name.upper()}...")
+        
+        try:
+            model = load_model(model_name, device=device)
+        except (FileNotFoundError, NotImplementedError) as e:
+            print(f"      ⚠️  Skipped: {str(e)}")
+            continue
+        
+        volume_predicted = volume_original.copy()
+        predictions_stage1 = {}
+        predictions_stage2 = {}
+        predictions_stage3 = {}
+        
+        with torch.no_grad():
+            # STAGE 1: (i, i+4) → Predict i+2
+            for slice_i, slice_i4, indices_batch in batch_hierarchical_pairs_for_inference(hierarchical_pairs, batch_size=batch_size):
+                slice_i = slice_i.to(device)
+                slice_i4 = slice_i4.to(device)
+                x_input = torch.cat([slice_i, slice_i4], dim=1)  # (B, 2, H, W)
+                pred_i2 = model(x_input)
+                
+                for idx_tuple, pred in zip(indices_batch, pred_i2):
+                    predictions_stage1[idx_tuple[2]] = pred.cpu().numpy()[0]
+            
+            # STAGE 2: (i, predicted i+2) → Predict i+1
+            for slice_i, slice_i4, indices_batch in batch_hierarchical_pairs_for_inference(hierarchical_pairs, batch_size=batch_size):
+                slice_i = slice_i.to(device)
+                
+                pred_i2_list = []
+                for idx_tuple in indices_batch:
+                    if idx_tuple[2] in predictions_stage1:
+                        pred_i2 = predictions_stage1[idx_tuple[2]]  # (H, W)
+                    else:
+                        pred_i2 = np.zeros((256, 256))
+                    pred_i2_list.append(torch.from_numpy(pred_i2).float().unsqueeze(0))  # (1, H, W)
+                
+                slice_i2 = torch.cat(pred_i2_list, dim=0).unsqueeze(1).to(device)  # (B, H, W) -> (B, 1, H, W)
+                x_input = torch.cat([slice_i, slice_i2], dim=1)  # (B, 2, H, W)
+                pred_i1 = model(x_input)
+                
+                for idx_tuple, pred in zip(indices_batch, pred_i1):
+                    predictions_stage2[idx_tuple[1]] = pred.cpu().numpy()[0]
+            
+            # STAGE 3: (predicted i+2, i+4) → Predict i+3
+            for slice_i, slice_i4, indices_batch in batch_hierarchical_pairs_for_inference(hierarchical_pairs, batch_size=batch_size):
+                slice_i4 = slice_i4.to(device)
+                
+                pred_i2_list = []
+                for idx_tuple in indices_batch:
+                    if idx_tuple[2] in predictions_stage1:
+                        pred_i2 = predictions_stage1[idx_tuple[2]]  # (H, W)
+                    else:
+                        pred_i2 = np.zeros((256, 256))
+                    pred_i2_list.append(torch.from_numpy(pred_i2).float().unsqueeze(0))  # (1, H, W)
+                
+                slice_i2 = torch.cat(pred_i2_list, dim=0).unsqueeze(1).to(device)  # (B, H, W) -> (B, 1, H, W)
+                x_input = torch.cat([slice_i2, slice_i4], dim=1)  # (B, 2, H, W)
+                pred_i3 = model(x_input)
+                
+                for idx_tuple, pred in zip(indices_batch, pred_i3):
+                    predictions_stage3[idx_tuple[3]] = pred.cpu().numpy()[0]
+        
+        # Fill volume
+        all_predictions = {**predictions_stage1, **predictions_stage2, **predictions_stage3}
+        for idx, pred in all_predictions.items():
+            if 0 <= idx < volume_predicted.shape[0]:
+                volume_predicted[idx] = pred
+        
+        all_models[model_name] = volume_predicted
+        print(f"      ✓ {model_name.upper()} prediction complete (3 stages)")
+    
+    # Visualize all models in parallel
+    print(f"\n4. Generating parallel visualization...")
+    visualize_all_models_parallel(all_models, volume_original, patient_name, seed=seed, save_path=save_path)
+    
+    print(f"\n{'='*70}")
+    print(f"✅ ALL MODELS PREDICTED & VISUALIZED!")
+    print(f"{'='*70}\n")
+
+
+def visualize_single_triplet_all_models(seed=None, device='cuda', save_path=None):
+    """
+    Visualize predictions from all models for a single triplet pair.
+    Shows: Pre slice, Post slice, Ground truth middle, and predicted middle for each model.
+    
+    Args:
+        seed: Random seed for reproducibility
+        device: 'cuda' or 'cpu'
+        save_path: Path to save the figure
+    """
+    
+    print(f"\n{'='*70}")
+    print(f"SINGLE TRIPLET VISUALIZATION - ALL MODELS")
+    print(f"{'='*70}")
+    
+    print(f"\n1. Loading random patient and selecting a triplet...")
+    data = get_patient_volume_and_triplets(seed=seed)
+    volume_original = data['volume']
+    triplets = data['triplets']
+    patient_name = data['patient_name']
+    
+    print(f"   Patient: {patient_name}")
+    print(f"   Total triplets: {len(triplets)}")
+    
+    # Select a random triplet from the middle range (to avoid edge cases)
+    if seed is not None:
+        np.random.seed(seed)
+    triplet_idx = np.random.randint(len(triplets) // 4, 3 * len(triplets) // 4)
+    selected_triplet = triplets[triplet_idx]
+    
+    pre = selected_triplet['pre'].to(device)  # (1, H, W)
+    post = selected_triplet['post'].to(device)  # (1, H, W)
+    ground_truth_middle = selected_triplet['middle']  # (1, H, W)
+    middle_index = selected_triplet['index']
+    
+    print(f"   Selected triplet index: {triplet_idx}")
+    print(f"   Slice indices: {middle_index - 1}, {middle_index} (GT), {middle_index + 1}")
+    
+    # Prepare input for all models
+    # pre and post are (1, H, W), need to reshape to (1, 1, H, W) each, then concatenate on channel dim
+    pre_input = pre.unsqueeze(0)  # (1, 1, H, W) - add batch dimension
+    post_input = post.unsqueeze(0)  # (1, 1, H, W) - add batch dimension
+    x_input = torch.cat([pre_input, post_input], dim=1)  # (1, 2, H, W)
+    
+    print(f"\n2. Running inference with all models...")
+    
+    all_predictions = {}
+    model_list = ['unet', 'unet_combined', 'deepcnn', 'progressive_unet', 'unet_gan']
+    
+    for model_name in model_list:
+        print(f"   ⏳ Processing {model_name.upper()}...")
+        
+        try:
+            model = load_model(model_name, device=device)
+        except (FileNotFoundError, NotImplementedError) as e:
+            print(f"      ⚠️  Skipped: {str(e)}")
+            continue
+        
+        with torch.no_grad():
+            if model_name.lower() == 'progressive_unet':
+                # Progressive UNet expects 5-slice window
+                # For this visualization, we'll skip it since we only have a triplet
+                print(f"      ⚠️  Skipped: Requires 5-slice window (triplet only available)")
+                continue
+            else:
+                # Standard models (UNet, DeepCNN, UNet-GAN, unet_combined)
+                pred_middle = model(x_input)  # (1, 1, H, W)
+                all_predictions[model_name] = pred_middle.cpu().squeeze(0)  # (1, H, W)
+    
+    print(f"\n3. Generating visualization...")
+    
+    num_models = len(all_predictions)
+    
+    # Normalize all slices independently (each to its own range)
+    pre_np = pre.cpu().squeeze(0).numpy()  # (H, W)
+    post_np = post.cpu().squeeze(0).numpy()  # (H, W)
+    gt_middle_np = ground_truth_middle.squeeze(0).numpy() if ground_truth_middle.dim() > 2 else ground_truth_middle.numpy()  # (H, W)
+    
+    # Each slice normalized independently to use full grayscale range
+    pre_norm = (pre_np - pre_np.min()) / (pre_np.max() - pre_np.min() + 1e-8)
+    post_norm = (post_np - post_np.min()) / (post_np.max() - post_np.min() + 1e-8)
+    gt_middle_norm = (gt_middle_np - gt_middle_np.min()) / (gt_middle_np.max() - gt_middle_np.min() + 1e-8)
+    
+    # Normalize model predictions independently too
+    model_predictions_norm = {}
+    for model_name, pred in all_predictions.items():
+        pred_np = pred.numpy() if isinstance(pred, torch.Tensor) else pred
+        pred_np = pred_np.squeeze() if pred_np.ndim > 2 else pred_np
+        pred_norm_val = (pred_np - pred_np.min()) / (pred_np.max() - pred_np.min() + 1e-8)
+        model_predictions_norm[model_name] = pred_norm_val
+    
+    # Create figure with one row per model (no reference row)
+    fig = plt.figure(figsize=(16, 4 * num_models))
+    
+    # Each row: PRE | POST | GROUND TRUTH | MODEL PREDICTION
+    for row_idx, (model_name, pred_norm) in enumerate(model_predictions_norm.items()):
+        # PRE slice
+        ax_pre_model = plt.subplot(num_models, 4, row_idx * 4 + 1)
+        im_pre_model = ax_pre_model.imshow(pre_norm, cmap='gray')
+        ax_pre_model.set_title(f'PRE\n(Slice {middle_index - 1})', fontsize=11, fontweight='bold', color='darkblue')
+        ax_pre_model.axis('off')
+        plt.colorbar(im_pre_model, ax=ax_pre_model, fraction=0.046, pad=0.04)
+        
+        # POST slice
+        ax_post_model = plt.subplot(num_models, 4, row_idx * 4 + 2)
+        im_post_model = ax_post_model.imshow(post_norm, cmap='gray')
+        ax_post_model.set_title(f'POST\n(Slice {middle_index + 1})', fontsize=11, fontweight='bold', color='darkblue')
+        ax_post_model.axis('off')
+        plt.colorbar(im_post_model, ax=ax_post_model, fraction=0.046, pad=0.04)
+        
+        # GROUND TRUTH slice
+        ax_gt_model = plt.subplot(num_models, 4, row_idx * 4 + 3)
+        im_gt_model = ax_gt_model.imshow(gt_middle_norm, cmap='gray')
+        ax_gt_model.set_title(f'GROUND TRUTH\n(Slice {middle_index})', fontsize=11, fontweight='bold', color='darkgreen')
+        ax_gt_model.axis('off')
+        plt.colorbar(im_gt_model, ax=ax_gt_model, fraction=0.046, pad=0.04)
+        
+        # MODEL PREDICTION
+        ax_pred_model = plt.subplot(num_models, 4, row_idx * 4 + 4)
+        im_pred_model = ax_pred_model.imshow(pred_norm, cmap='gray')
+        
+        # Calculate MSE with ground truth
+        mse = np.mean((gt_middle_norm - pred_norm) ** 2)
+        
+        ax_pred_model.set_title(f'{model_name.upper()}\nMSE: {mse:.4f}', fontsize=11, fontweight='bold', color='darkred')
+        ax_pred_model.axis('off')
+        plt.colorbar(im_pred_model, ax=ax_pred_model, fraction=0.046, pad=0.04)
+    
+    # Overall title
+    title_str = f'Single Triplet Prediction Comparison - All Models\nPatient: {patient_name} (Triplet Index: {triplet_idx}, Seed: {seed})'
+    fig.suptitle(title_str, fontsize=14, fontweight='bold', y=0.995)
+    
+    plt.tight_layout(rect=[0, 0, 1, 0.99])
+    
+    # Save if path provided
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"   ✓ Visualization saved to: {save_path}")
+    
+    plt.show()
+    
+    print(f"\n{'='*70}")
+    print(f"✅ SINGLE TRIPLET VISUALIZATION COMPLETE!")
+    print(f"{'='*70}\n")
 
 
 def predict_volume_and_visualize(seed=None, device='cuda', batch_size=8, save_path=None, parallel_viz=True):
@@ -434,16 +937,14 @@ def predict_volume_and_visualize(seed=None, device='cuda', batch_size=8, save_pa
             else:
                 # Standard models (UNet, DeepCNN, UNet-GAN) use triplets
                 for pre_batch, post_batch, indices in batch_triplets_for_inference(triplets, batch_size=batch_size):
-                    pre_batch = pre_batch.unsqueeze(1)   # (B, 1, 1, H, W) -> (B, 1, H, W) already correct
-                    post_batch = post_batch.unsqueeze(1) # Same
                     pre_batch = pre_batch.to(device)
                     post_batch = post_batch.to(device)
                 
-                    # Stack pre and post as input
-                    x_input = torch.cat([pre_batch, post_batch], dim=1)  # (B, 2, H, W)
+                    # Stack pre and post as input (B, 2, H, W)
+                    x_input = torch.cat([pre_batch, post_batch], dim=1)
                 
                     # Predict
-                    predictions = model(x_input)  # Output shape depends on model
+                    predictions = model(x_input)
                 
                     # Handle different model output shapes
                     pred_middle = predictions  # (B, 1, H, W)
@@ -521,23 +1022,49 @@ def predict_volume_and_visualize(seed=None, device='cuda', batch_size=8, save_pa
 
 
 if __name__ == "__main__":
-    # Example usage
-    print("Loading random patient from test set...")
-    data = get_patient_volume_and_triplets(seed=42)
+    # Example 1: Standard triplet prediction with all models
+    # predict_volume_and_visualize(seed=42, device='cuda', batch_size=16)
     
+    # Example 2: Hierarchical 4-slice reconstruction with a specific model
+    print("="*70)
+    print("EXAMPLE 1: Hierarchical 4-Slice (Single Model)")
+    print("="*70)
+    
+    # result = predict_volume_hierarchical(
+    #     model_name='unet',  # Choose: 'unet', 'deepcnn', 'unet_gan'
+    #     seed=42,
+    #     device='cuda',
+    #     batch_size=16
+    # )
+    
+    # Example 3: Hierarchical with all models in parallel visualization
+    print("\n" + "="*70)
+    print("EXAMPLE 2: Hierarchical 4-Slice (All Models - Parallel Visualization)")
+    print("="*70)
+    
+    # predict_volume_hierarchical_all_models(
+    #     seed=42,
+    #     device='cuda',
+    #     batch_size=16,
+    #     save_path='results/hierarchical_all_models.png'
+    # )
+    
+    # Example 3: Data structure exploration
+    print("\n" + "="*70)
+    print("DATA STRUCTURE")
+    print("="*70)
+    
+    data = get_patient_volume_and_triplets(seed=42)
     print(f"\nPatient: {data['patient_name']}")
     print(f"Volume shape: {data['volume'].shape}")
-    print(f"Number of triplets: {data['num_triplets']}")
-    print(f"Series path: {data['series_path']}")
     
     triplets = data['triplets']
-    print(f"\nFirst triplet:")
+    print(f"\nTriplet (for standard models):")
     print(f"  Pre shape: {triplets[0]['pre'].shape}")
     print(f"  Post shape: {triplets[0]['post'].shape}")
-    print(f"  Middle shape: {triplets[0]['middle'].shape}")
-    print(f"  Middle slice index: {triplets[0]['index']}")
     
-    # Demonstrate batching
-    print(f"\nBatching triplets for inference (batch_size=8):")
-    for batch_num, (pre, post, indices) in enumerate(batch_triplets_for_inference(triplets, batch_size=8)):
-        print(f"  Batch {batch_num + 1}: pre {pre.shape}, post {post.shape}, indices {indices}")
+    pairs = generate_hierarchical_4slice_pairs(data['volume'])
+    print(f"\nHierarchical pair (i, i+4):")
+    print(f"  Slice i shape: {pairs[0]['slice_i'].shape}")
+    print(f"  Slice i+4 shape: {pairs[0]['slice_i_plus_4'].shape}")
+    print(f"  Indices: {pairs[0]['indices']}")
