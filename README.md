@@ -199,8 +199,3 @@ Training curves and predictions are saved in `results/`:
 - **For probabilistic predictions & uncertainty:** **FastDDPM** offers a principled way to model the data distribution and generate multiple plausible completions. This is useful when you need uncertainty estimates or want to ensemble predictions.
 
 - **Combined evaluation caveats:** When reporting results for publication or comparison, **always separate metrics by spacing** (1.5mm vs 3.0mm) to fairly compare against SOTA methods that may focus on one spacing only. Our aggregated SSIM (~0.72) is lower than single-spacing methods (which may report 0.75-0.80) because we evaluate both difficult (3mm) and easy (1.5mm) cases together.
-
-## Next actions I can take for you
-- Add a script that computes per-case metrics split by spacing and writes to CSV. This helps show explicitly why aggregated SSIM is lower.
-- Add a small demo runner that saves a few example visualizations to `results/` for quick inspection.
-- Pin `torch` and `torchvision` variants for CUDA/CPU if you want explicit install instructions.
