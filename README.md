@@ -80,9 +80,6 @@ This project implements and compares several models for middle-slice prediction.
 - Strengths: can produce visually sharper outputs and recover finer textures compared to pure MSE-trained models, but may introduce hallucinated details and is harder to stabilize.
 - Use when: visual fidelity (sharpness) is critical and you can tolerate GAN training complexity.
 
-### unet_combined
-- This is a variant referenced by the loader (see `src/ModelLoader.py`). It follows the UNet architecture but may be trained on combined triplet types or with data augmentation strategies that mix spacings. Behavior is similar to the UNet baseline but training differences can yield different robustness.
-
 ### FastDDPM (Fast Denoising Diffusion Probabilistic Models)
 - Architecture: UNet-style generator conditioned on diffusion timestep embeddings. Time embeddings are learned via a TimeEmbedding layer and injected into each residual block via adaptive scaling.
 - How it works:
