@@ -463,6 +463,179 @@ class UNetGenerator(nn.Module):
         return x
 
 # ============================================================================
+# FASTDDPM MODEL - From FastDDPM_Simple.ipynb
+# ============================================================================
+
+import math
+
+def sinusoidal_timestep_embedding(timesteps, dim):
+    """
+    Standard sinusoidal time embedding (as in DDPM, DDIM, LDM).
+    Creates a fixed positional encoding for timesteps.
+    """
+    device = timesteps.device
+    half = dim // 2
+    freqs = torch.exp(
+        -math.log(10000) * torch.arange(0, half, dtype=torch.float32, device=device) / half
+    )
+    args = timesteps[:, None].float() * freqs[None]
+    emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+    return emb
+
+
+class FastNoiseScheduler:
+    """
+    Fast noise scheduler with non-uniform timestep sampling.
+    Emphasizes early denoising steps (40% early, 60% late from original 1000-step schedule).
+    This reduces inference time from 1000 to 10 steps without quality loss.
+    """
+    def __init__(self, T, device):
+        self.T = T
+        self.device = device
+
+        # Load 1000-step DDPM scheduler (linear β)
+        beta = torch.linspace(1e-4, 0.02, 1000)
+        alpha = 1.0 - beta
+        alpha_bar = torch.cumprod(alpha, 0)
+
+        # Non-uniform sampling: emphasize early denoising (more important)
+        boundary = 699
+        late_steps = int(T * 0.6)
+        early_steps = T - late_steps
+
+        idx_early = torch.linspace(0, boundary, early_steps).long()
+        idx_late = torch.linspace(boundary, 999, late_steps).long()
+
+        idxs = torch.sort(torch.cat([idx_early, idx_late]))[0]
+
+        self.beta = beta[idxs].to(device)
+        self.alpha = alpha[idxs].to(device)
+        self.alpha_bar = alpha_bar[idxs].to(device)
+
+    def q_sample(self, x0, t, noise):
+        """Forward diffusion: add noise to image at timestep t"""
+        a_bar = self.alpha_bar[t].view(-1, 1, 1, 1)
+        return torch.sqrt(a_bar) * x0 + torch.sqrt(1 - a_bar) * noise
+
+
+class DoubleConv(nn.Module):
+    """Double convolution block with ReLU activation"""
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1),
+            nn.ReLU(True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1),
+            nn.ReLU(True)
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class UNet2D(nn.Module):
+    """
+    Improved 2D UNet with sinusoidal timestep embeddings.
+    Uses better time conditioning with MLPs.
+    """
+    def __init__(self, in_ch=3, base_ch=64, time_dim=256):
+        super().__init__()
+
+        # Better time embedding: sinusoidal -> MLP
+        self.time_mlp = nn.Sequential(
+            nn.Linear(time_dim, time_dim),
+            nn.ReLU(True),
+            nn.Linear(time_dim, time_dim),
+        )
+
+        # Encoder
+        self.inc = DoubleConv(in_ch + time_dim, base_ch)
+        self.down1 = DoubleConv(base_ch, base_ch * 2)
+        self.down2 = DoubleConv(base_ch * 2, base_ch * 4)
+
+        # Decoder
+        self.up2 = DoubleConv(base_ch * 4 + base_ch * 2, base_ch * 2)
+        self.up1 = DoubleConv(base_ch * 2 + base_ch, base_ch)
+
+        # Output layer
+        self.outc = nn.Conv2d(base_ch, 1, 1)
+
+    def forward(self, x, t):
+        # Generate sinusoidal embeddings -> pass through MLP
+        t_emb = sinusoidal_timestep_embedding(t, 256)
+        t_emb = self.time_mlp(t_emb)
+        t_emb = t_emb[:, :, None, None].repeat(1, 1, x.shape[2], x.shape[3])
+
+        # Concatenate time embeddings into channel dimension
+        x = torch.cat([x, t_emb], dim=1)
+
+        # Encoder
+        c1 = self.inc(x)
+        c2 = self.down1(F.max_pool2d(c1, 2))
+        c3 = self.down2(F.max_pool2d(c2, 2))
+
+        # Decoder
+        u2 = F.interpolate(c3, scale_factor=2)
+        u2 = self.up2(torch.cat([u2, c2], dim=1))
+
+        u1 = F.interpolate(u2, scale_factor=2)
+        u1 = self.up1(torch.cat([u1, c1], dim=1))
+
+        return self.outc(u1)
+
+
+class FastDDPM(nn.Module):
+    """Fast DDPM model with non-uniform scheduling for medical image super-resolution"""
+    def __init__(self, T=10, device='cuda'):
+        super().__init__()
+        self.device = device
+        self.scheduler = FastNoiseScheduler(T, device)
+        self.unet = UNet2D(in_ch=3, base_ch=64, time_dim=256).to(device)
+
+    def forward(self, cond, target, t):
+        """Training forward pass: predict noise"""
+        noise = torch.randn_like(target)
+        a_bar = self.scheduler.alpha_bar[t].view(-1, 1, 1, 1)
+        x_t = torch.sqrt(a_bar) * target + torch.sqrt(1 - a_bar) * noise
+
+        pred_noise = self.unet(torch.cat([x_t, cond], dim=1), t)
+        return F.mse_loss(pred_noise, noise)
+
+    @torch.no_grad()
+    def sample(self, cond, device):
+        """
+        DDIM sampling: reverse diffusion process for inference.
+        Much faster than DDPM sampling (10 steps vs 1000).
+        
+        Args:
+            cond: concatenated [pre, post] slices (B, 2, H, W)
+            device: torch device
+        Returns:
+            predicted middle slice (B, 1, H, W)
+        """
+        B, _, H, W = cond.shape
+        x = torch.randn(B, 1, H, W).to(device)
+
+        T = self.scheduler.T
+
+        for i in reversed(range(T)):
+            t = torch.full((B,), i, device=device, dtype=torch.long)
+
+            # Predict noise
+            eps = self.unet(torch.cat([x, cond], 1), t)
+
+            a_bar = self.scheduler.alpha_bar[i]
+            a_bar_prev = self.scheduler.alpha_bar[i - 1] if i > 0 else torch.tensor(1.0).to(device)
+
+            # Estimate x0
+            x0 = (x - torch.sqrt(1 - a_bar) * eps) / torch.sqrt(a_bar)
+
+            # Update x
+            x = torch.sqrt(a_bar_prev) * x0 + torch.sqrt(1 - a_bar_prev) * eps
+
+        return x.clamp(-1, 1)
+
+# ============================================================================
 # MODEL LOADER FUNCTION
 # ============================================================================
 
@@ -472,7 +645,7 @@ def load_model(model_name, device='cuda'):
     Uses correct model architectures from notebooks.
     
     Args:
-        model_name: Model identifier - 'unet', 'deepcnn', 'progressive_unet', 'unet_gan'
+        model_name: Model identifier - 'unet', 'deepcnn', 'progressive_unet', 'unet_gan', 'fastddpm'
         device: 'cuda' or 'cpu'
     
     Returns:
@@ -492,6 +665,7 @@ def load_model(model_name, device='cuda'):
         'deepcnn': ('deepcnn_best.pt', DeepCNN, {'in_channels': 2, 'out_channels': 1, 'num_blocks': [2, 2, 2, 2], 'base_features': 64}),
         'progressive_unet': ('progressive_unet_best.pt', ProgressiveUNet, {'base_features': 64}),
         'unet_gan': ('unet_gan_best.pt', UNetGenerator, {'in_channels': 2, 'out_channels': 1, 'base_features': 64}),
+        'fastddpm': ('fastddpm_advanced_best.pth', FastDDPM, {'T': 10, 'device': device}),
     }
     
     model_name_lower = model_name.lower()
@@ -501,6 +675,12 @@ def load_model(model_name, device='cuda'):
     
     checkpoint_file, model_class, init_kwargs = checkpoint_map[model_name_lower]
     checkpoint_path = os.path.join(models_dir, checkpoint_file)
+    
+    # If not found in models/, try notebooks/
+    if not os.path.exists(checkpoint_path):
+        notebooks_dir = os.path.join(parent_dir, 'notebooks')
+        checkpoint_path = os.path.join(notebooks_dir, checkpoint_file)
+    
     print(checkpoint_path)
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
@@ -508,12 +688,22 @@ def load_model(model_name, device='cuda'):
     # Initialize and load model
     model = model_class(**init_kwargs).to(device)
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    if(model_name_lower == 'unet_gan'):
-        model.load_state_dict(checkpoint['generator_state_dict'])
-    else:
-        model.load_state_dict(checkpoint['model_state_dict'])
     
-    #model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+    # Handle different checkpoint formats
+    if isinstance(checkpoint, dict):
+        if 'generator_state_dict' in checkpoint:
+            # GAN checkpoint format
+            model.load_state_dict(checkpoint['generator_state_dict'])
+        elif 'model_state_dict' in checkpoint:
+            # Standard checkpoint format with 'model_state_dict' key
+            model.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            # Direct state_dict (as saved by torch.save(model.state_dict(), ...))
+            model.load_state_dict(checkpoint)
+    else:
+        # Fallback: assume it's a state dict
+        model.load_state_dict(checkpoint)
+    
     model.eval()
     
     print(f"✓ Loaded {model_name.upper()} model from {os.path.basename(checkpoint_path)}")
@@ -528,3 +718,4 @@ if __name__ == "__main__":
     print("  - deepcnn")
     print("  - progressive_unet")
     print("  - unet_gan")
+    print("  - fastddpm")

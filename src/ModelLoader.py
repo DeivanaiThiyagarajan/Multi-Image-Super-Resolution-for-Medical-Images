@@ -463,308 +463,177 @@ class UNetGenerator(nn.Module):
         return x
 
 # ============================================================================
-# FASTDDPM MODEL - From FastDDPM_Advanced.ipynb
+# FASTDDPM MODEL - From FastDDPM_Simple.ipynb
 # ============================================================================
 
-def sinusoidal_timestep_embedding(timesteps, dim, max_period=10000):
+import math
+
+def sinusoidal_timestep_embedding(timesteps, dim):
     """
-    Generate sinusoidal timestep embeddings.
-    
-    Args:
-        timesteps: (B,) tensor of timestep indices
-        dim: Embedding dimension (must be even)
-        max_period: Maximum period for sinusoidal waves
-    
-    Returns:
-        (B, dim) tensor of positional encodings
+    Standard sinusoidal time embedding (as in DDPM, DDIM, LDM).
+    Creates a fixed positional encoding for timesteps.
     """
-    half_dim = dim // 2
+    device = timesteps.device
+    half = dim // 2
     freqs = torch.exp(
-        -torch.log(torch.tensor(max_period, dtype=torch.float32)) *
-        torch.arange(half_dim, dtype=torch.float32) / half_dim
+        -math.log(10000) * torch.arange(0, half, dtype=torch.float32, device=device) / half
     )
-    
-    # (B,) -> (B, half_dim)
-    args = timesteps[:, None] * freqs[None, :]
-    
-    # Concatenate sin and cos
-    embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-    
-    return embedding
+    args = timesteps[:, None].float() * freqs[None]
+    emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+    return emb
 
 
 class FastNoiseScheduler:
     """
     Fast noise scheduler with non-uniform timestep sampling.
-    Emphasizes early and late timesteps while maintaining DDPM's variance schedule.
-    
-    T=10 timesteps: 40% from early steps (0-699), 60% from late steps (699-999)
+    Emphasizes early denoising steps (40% early, 60% late from original 1000-step schedule).
+    This reduces inference time from 1000 to 10 steps without quality loss.
     """
-    def __init__(self, num_diffusion_steps=1000, T=10):
-        """
-        Args:
-            num_diffusion_steps: Total diffusion steps in full DDPM (default 1000)
-            T: Number of steps to sample (default 10 for ~100x speedup)
-        """
-        self.num_diffusion_steps = num_diffusion_steps
+    def __init__(self, T, device):
         self.T = T
-        
-        # Compute alphas and betas for full schedule
-        self.betas = torch.linspace(0.0001, 0.02, num_diffusion_steps)
-        self.alphas = 1.0 - self.betas
-        self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
-        
-        # Non-uniform timestep selection
-        early_steps = int(0.4 * T)
-        late_steps = T - early_steps
-        
-        early_indices = torch.linspace(0, int(0.7 * num_diffusion_steps) - 1, early_steps).long()
-        late_indices = torch.linspace(int(0.7 * num_diffusion_steps), num_diffusion_steps - 1, late_steps).long()
-        
-        self.timesteps = torch.cat([early_indices, late_indices])
-    
-    def get_timesteps(self):
-        """Return sampled timesteps"""
-        return self.timesteps
-    
-    def get_alpha_cumprod(self, t):
-        """Get cumulative product of alphas for timestep t"""
-        return self.alphas_cumprod[t]
-    
-    def get_sigma(self, t_prev, t):
-        """Compute standard deviation for reverse step"""
-        alpha_t = self.alphas_cumprod[t]
-        alpha_t_prev = self.alphas_cumprod[t_prev] if t_prev >= 0 else torch.tensor(1.0)
-        beta_t = 1 - alpha_t / alpha_t_prev
-        return torch.sqrt(beta_t)
+        self.device = device
+
+        # Load 1000-step DDPM scheduler (linear β)
+        beta = torch.linspace(1e-4, 0.02, 1000)
+        alpha = 1.0 - beta
+        alpha_bar = torch.cumprod(alpha, 0)
+
+        # Non-uniform sampling: emphasize early denoising (more important)
+        boundary = 699
+        late_steps = int(T * 0.6)
+        early_steps = T - late_steps
+
+        idx_early = torch.linspace(0, boundary, early_steps).long()
+        idx_late = torch.linspace(boundary, 999, late_steps).long()
+
+        idxs = torch.sort(torch.cat([idx_early, idx_late]))[0]
+
+        self.beta = beta[idxs].to(device)
+        self.alpha = alpha[idxs].to(device)
+        self.alpha_bar = alpha_bar[idxs].to(device)
+
+    def q_sample(self, x0, t, noise):
+        """Forward diffusion: add noise to image at timestep t"""
+        a_bar = self.alpha_bar[t].view(-1, 1, 1, 1)
+        return torch.sqrt(a_bar) * x0 + torch.sqrt(1 - a_bar) * noise
 
 
 class DoubleConv(nn.Module):
-    """Double convolution block (Conv -> BN -> ReLU -> Conv -> BN -> ReLU)"""
-    def __init__(self, in_channels, out_channels, mid_channels=None):
+    """Double convolution block with ReLU activation"""
+    def __init__(self, in_ch, out_ch):
         super().__init__()
-        if mid_channels is None:
-            mid_channels = out_channels
-        
-        self.double_conv = nn.Sequential(
-            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(mid_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
+        self.block = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1),
+            nn.ReLU(True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1),
+            nn.ReLU(True)
         )
-    
+
     def forward(self, x):
-        return self.double_conv(x)
+        return self.block(x)
 
 
 class UNet2D(nn.Module):
     """
-    U-Net architecture for conditional image generation.
-    Incorporates timestep embeddings via MLPs in skip connections.
+    Improved 2D UNet with sinusoidal timestep embeddings.
+    Uses better time conditioning with MLPs.
     """
-    def __init__(self, in_channels=2, out_channels=1, base_channels=64, time_embed_dim=256):
+    def __init__(self, in_ch=3, base_ch=64, time_dim=256):
         super().__init__()
-        
-        self.time_embed_dim = time_embed_dim
-        
-        # Initial projection
-        self.initial_conv = DoubleConv(in_channels, base_channels)
-        
+
+        # Better time embedding: sinusoidal -> MLP
+        self.time_mlp = nn.Sequential(
+            nn.Linear(time_dim, time_dim),
+            nn.ReLU(True),
+            nn.Linear(time_dim, time_dim),
+        )
+
         # Encoder
-        self.down1 = nn.MaxPool2d(2)
-        self.conv1 = DoubleConv(base_channels, base_channels * 2)
-        
-        self.down2 = nn.MaxPool2d(2)
-        self.conv2 = DoubleConv(base_channels * 2, base_channels * 4)
-        
-        self.down3 = nn.MaxPool2d(2)
-        self.conv3 = DoubleConv(base_channels * 4, base_channels * 8)
-        
-        # Bottleneck
-        self.bottleneck = DoubleConv(base_channels * 8, base_channels * 16)
-        
-        # Decoder with time conditioning
-        self.up3 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        self.time_mlp3 = nn.Sequential(
-            nn.Linear(time_embed_dim, base_channels * 8),
-            nn.SiLU(),
-            nn.Linear(base_channels * 8, base_channels * 8)
-        )
-        self.conv_up3 = DoubleConv(base_channels * 16, base_channels * 8)
-        
-        self.up2 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        self.time_mlp2 = nn.Sequential(
-            nn.Linear(time_embed_dim, base_channels * 4),
-            nn.SiLU(),
-            nn.Linear(base_channels * 4, base_channels * 4)
-        )
-        self.conv_up2 = DoubleConv(base_channels * 8, base_channels * 4)
-        
-        self.up1 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        self.time_mlp1 = nn.Sequential(
-            nn.Linear(time_embed_dim, base_channels * 2),
-            nn.SiLU(),
-            nn.Linear(base_channels * 2, base_channels * 2)
-        )
-        self.conv_up1 = DoubleConv(base_channels * 4, base_channels * 2)
-        
-        # Final output
-        self.final_conv = nn.Conv2d(base_channels, out_channels, kernel_size=1)
-    
-    def forward(self, x, time_embedding):
-        """
-        Args:
-            x: (B, 2, H, W) input image
-            time_embedding: (B, time_embed_dim) timestep embedding
-        """
+        self.inc = DoubleConv(in_ch + time_dim, base_ch)
+        self.down1 = DoubleConv(base_ch, base_ch * 2)
+        self.down2 = DoubleConv(base_ch * 2, base_ch * 4)
+
+        # Decoder
+        self.up2 = DoubleConv(base_ch * 4 + base_ch * 2, base_ch * 2)
+        self.up1 = DoubleConv(base_ch * 2 + base_ch, base_ch)
+
+        # Output layer
+        self.outc = nn.Conv2d(base_ch, 1, 1)
+
+    def forward(self, x, t):
+        # Generate sinusoidal embeddings -> pass through MLP
+        t_emb = sinusoidal_timestep_embedding(t, 256)
+        t_emb = self.time_mlp(t_emb)
+        t_emb = t_emb[:, :, None, None].repeat(1, 1, x.shape[2], x.shape[3])
+
+        # Concatenate time embeddings into channel dimension
+        x = torch.cat([x, t_emb], dim=1)
+
         # Encoder
-        x0 = self.initial_conv(x)
-        
-        x = self.down1(x0)
-        x1 = self.conv1(x)
-        
-        x = self.down2(x1)
-        x2 = self.conv2(x)
-        
-        x = self.down3(x2)
-        x3 = self.conv3(x)
-        
-        # Bottleneck
-        x = self.bottleneck(x3)
-        
-        # Decoder with time conditioning
-        x = self.up3(x)
-        time_cond3 = self.time_mlp3(time_embedding)
-        time_cond3 = time_cond3[:, :, None, None]  # (B, C, 1, 1)
-        x3_conditioned = x3 * time_cond3
-        x = torch.cat([x, x3_conditioned], dim=1)
-        x = self.conv_up3(x)
-        
-        x = self.up2(x)
-        time_cond2 = self.time_mlp2(time_embedding)
-        time_cond2 = time_cond2[:, :, None, None]
-        x2_conditioned = x2 * time_cond2
-        x = torch.cat([x, x2_conditioned], dim=1)
-        x = self.conv_up2(x)
-        
-        x = self.up1(x)
-        time_cond1 = self.time_mlp1(time_embedding)
-        time_cond1 = time_cond1[:, :, None, None]
-        x1_conditioned = x1 * time_cond1
-        x = torch.cat([x, x1_conditioned], dim=1)
-        x = self.conv_up1(x)
-        
-        # Output
-        x = self.final_conv(x)
-        
-        return x
+        c1 = self.inc(x)
+        c2 = self.down1(F.max_pool2d(c1, 2))
+        c3 = self.down2(F.max_pool2d(c2, 2))
+
+        # Decoder
+        u2 = F.interpolate(c3, scale_factor=2)
+        u2 = self.up2(torch.cat([u2, c2], dim=1))
+
+        u1 = F.interpolate(u2, scale_factor=2)
+        u1 = self.up1(torch.cat([u1, c1], dim=1))
+
+        return self.outc(u1)
 
 
 class FastDDPM(nn.Module):
-    """
-    Fast Denoising Diffusion Probabilistic Model with T=10 timesteps.
-    Uses non-uniform timestep sampling for 100x faster generation.
-    
-    Input: (B, 2, H, W) - prior and posterior slices
-    Output: (B, 1, H, W) - predicted middle slice
-    """
-    def __init__(self, in_channels=2, out_channels=1, base_channels=64, 
-                 time_embed_dim=256, num_diffusion_steps=1000, T=10):
+    """Fast DDPM model with non-uniform scheduling for medical image super-resolution"""
+    def __init__(self, T=10, device='cuda'):
         super().__init__()
-        
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.base_channels = base_channels
-        self.time_embed_dim = time_embed_dim
-        self.num_diffusion_steps = num_diffusion_steps
-        self.T = T
-        
-        # Time embedding
-        self.time_embedding_layer = nn.Sequential(
-            nn.Linear(time_embed_dim, time_embed_dim),
-            nn.SiLU(),
-            nn.Linear(time_embed_dim, time_embed_dim)
-        )
-        
-        # UNet2D
-        self.unet = UNet2D(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            base_channels=base_channels,
-            time_embed_dim=time_embed_dim
-        )
-        
-        # Noise schedule
-        self.scheduler = FastNoiseScheduler(num_diffusion_steps=num_diffusion_steps, T=T)
-    
-    def forward(self, x_t, t):
+        self.device = device
+        self.scheduler = FastNoiseScheduler(T, device)
+        self.unet = UNet2D(in_ch=3, base_ch=64, time_dim=256).to(device)
+
+    def forward(self, cond, target, t):
+        """Training forward pass: predict noise"""
+        noise = torch.randn_like(target)
+        a_bar = self.scheduler.alpha_bar[t].view(-1, 1, 1, 1)
+        x_t = torch.sqrt(a_bar) * target + torch.sqrt(1 - a_bar) * noise
+
+        pred_noise = self.unet(torch.cat([x_t, cond], dim=1), t)
+        return F.mse_loss(pred_noise, noise)
+
+    @torch.no_grad()
+    def sample(self, cond, device):
         """
-        Training forward pass: predict noise.
+        DDIM sampling: reverse diffusion process for inference.
+        Much faster than DDPM sampling (10 steps vs 1000).
         
         Args:
-            x_t: (B, 2, H, W) noisy input at timestep t
-            t: (B,) timestep indices
-        
+            cond: concatenated [pre, post] slices (B, 2, H, W)
+            device: torch device
         Returns:
-            noise_pred: (B, 1, H, W) predicted noise
+            predicted middle slice (B, 1, H, W)
         """
-        # Get timestep embedding
-        time_embed = sinusoidal_timestep_embedding(t, self.time_embed_dim).to(x_t.device)
-        time_embed = self.time_embedding_layer(time_embed)
-        
-        # Predict noise
-        noise_pred = self.unet(x_t, time_embed)
-        
-        return noise_pred
-    
-    def sample(self, conditions, num_steps=10, device='cuda'):
-        """
-        DDIM sampling for fast generation.
-        
-        Args:
-            conditions: (B, 2, H, W) conditioning slices (prior and posterior)
-            num_steps: Number of reverse diffusion steps (typically 10)
-            device: Device to use
-        
-        Returns:
-            samples: (B, 1, H, W) generated middle slices
-        """
-        self.eval()
-        
-        batch_size = conditions.shape[0]
-        
-        # Start from noise
-        x = torch.randn(batch_size, self.out_channels, conditions.shape[2], conditions.shape[3], device=device)
-        
-        # Get timesteps
-        timesteps = self.scheduler.get_timesteps()[:num_steps]
-        
-        with torch.no_grad():
-            for i, t in enumerate(timesteps):
-                t_tensor = torch.full((batch_size,), t, dtype=torch.long, device=device)
-                
-                # Concatenate conditioning with current noise
-                x_in = torch.cat([conditions, x], dim=1)
-                
-                # Predict noise
-                noise_pred = self.forward(x_in, t_tensor)
-                
-                # DDIM update
-                alpha_t = self.scheduler.get_alpha_cumprod(t).to(device)
-                
-                if i < num_steps - 1:
-                    t_prev = timesteps[i + 1]
-                    alpha_t_prev = self.scheduler.get_alpha_cumprod(t_prev).to(device)
-                else:
-                    alpha_t_prev = torch.tensor(1.0, device=device)
-                
-                # DDIM step
-                x = (torch.sqrt(alpha_t_prev) / torch.sqrt(alpha_t)) * (x - torch.sqrt(1 - alpha_t) * noise_pred) + \
-                    torch.sqrt(1 - alpha_t_prev) * noise_pred
-        
-        return x
+        B, _, H, W = cond.shape
+        x = torch.randn(B, 1, H, W).to(device)
+
+        T = self.scheduler.T
+
+        for i in reversed(range(T)):
+            t = torch.full((B,), i, device=device, dtype=torch.long)
+
+            # Predict noise
+            eps = self.unet(torch.cat([x, cond], 1), t)
+
+            a_bar = self.scheduler.alpha_bar[i]
+            a_bar_prev = self.scheduler.alpha_bar[i - 1] if i > 0 else torch.tensor(1.0).to(device)
+
+            # Estimate x0
+            x0 = (x - torch.sqrt(1 - a_bar) * eps) / torch.sqrt(a_bar)
+
+            # Update x
+            x = torch.sqrt(a_bar_prev) * x0 + torch.sqrt(1 - a_bar_prev) * eps
+
+        return x.clamp(-1, 1)
 
 # ============================================================================
 # MODEL LOADER FUNCTION
@@ -796,7 +665,7 @@ def load_model(model_name, device='cuda'):
         'deepcnn': ('deepcnn_best.pt', DeepCNN, {'in_channels': 2, 'out_channels': 1, 'num_blocks': [2, 2, 2, 2], 'base_features': 64}),
         'progressive_unet': ('progressive_unet_best.pt', ProgressiveUNet, {'base_features': 64}),
         'unet_gan': ('unet_gan_best.pt', UNetGenerator, {'in_channels': 2, 'out_channels': 1, 'base_features': 64}),
-        'fastddpm': ('fastddpm_advanced_best.pth', FastDDPM, {'in_channels': 2, 'out_channels': 1, 'base_channels': 64, 'time_embed_dim': 256, 'num_diffusion_steps': 1000, 'T': 10}),
+        'fastddpm': ('fastddpm_advanced_best.pth', FastDDPM, {'T': 10, 'device': device}),
     }
     
     model_name_lower = model_name.lower()
@@ -806,6 +675,12 @@ def load_model(model_name, device='cuda'):
     
     checkpoint_file, model_class, init_kwargs = checkpoint_map[model_name_lower]
     checkpoint_path = os.path.join(models_dir, checkpoint_file)
+    
+    # If not found in models/, try notebooks/
+    if not os.path.exists(checkpoint_path):
+        notebooks_dir = os.path.join(parent_dir, 'notebooks')
+        checkpoint_path = os.path.join(notebooks_dir, checkpoint_file)
+    
     print(checkpoint_path)
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
@@ -815,12 +690,19 @@ def load_model(model_name, device='cuda'):
     checkpoint = torch.load(checkpoint_path, map_location=device)
     
     # Handle different checkpoint formats
-    if model_name_lower == 'unet_gan':
-        model.load_state_dict(checkpoint['generator_state_dict'])
-    elif model_name_lower == 'fastddpm':
-        model.load_state_dict(checkpoint['model_state_dict'])
+    if isinstance(checkpoint, dict):
+        if 'generator_state_dict' in checkpoint:
+            # GAN checkpoint format
+            model.load_state_dict(checkpoint['generator_state_dict'])
+        elif 'model_state_dict' in checkpoint:
+            # Standard checkpoint format with 'model_state_dict' key
+            model.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            # Direct state_dict (as saved by torch.save(model.state_dict(), ...))
+            model.load_state_dict(checkpoint)
     else:
-        model.load_state_dict(checkpoint['model_state_dict'])
+        # Fallback: assume it's a state dict
+        model.load_state_dict(checkpoint)
     
     model.eval()
     

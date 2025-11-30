@@ -232,9 +232,17 @@ def load_model(model_name, device='cuda'):
 
 def compute_metrics(original, predicted):
     """Compute SSIM, PSNR, and MAE between original and predicted volumes"""
-    # Normalize volumes
-    orig_norm = (original - original.min()) / (original.max() - original.min() + 1e-8)
-    pred_norm = (predicted - predicted.min()) / (predicted.max() - predicted.min() + 1e-8)
+    # Normalize volumes using ORIGINAL volume's range as reference
+    # This ensures predictions stay in proper range even if very dark/light
+    orig_min = original.min()
+    orig_max = original.max()
+    orig_range = orig_max - orig_min + 1e-8
+    
+    orig_norm = (original - orig_min) / orig_range
+    pred_norm = (predicted - orig_min) / orig_range  # Use original's range, not prediction's range
+    
+    # Clip predictions to valid range [0, 1]
+    pred_norm = np.clip(pred_norm, 0, 1)
     
     # Compute metrics across all slices
     ssim_scores = []
@@ -276,8 +284,11 @@ def visualize_all_models_parallel(all_models, volume_original, patient_name, see
     print(f"\n📊 Computing metrics for all models...")
     metrics_dict = {}
     
-    # Normalize original volume
-    orig_norm = (volume_original - volume_original.min()) / (volume_original.max() - volume_original.min() + 1e-8)
+    # Normalize original volume using consistent range
+    orig_min = volume_original.min()
+    orig_max = volume_original.max()
+    orig_range = orig_max - orig_min + 1e-8
+    orig_norm = (volume_original - orig_min) / orig_range
     
     for model_name, volume_pred in all_models.items():
         metrics = compute_metrics(volume_original, volume_pred)
@@ -298,10 +309,9 @@ def visualize_all_models_parallel(all_models, volume_original, patient_name, see
     sagittal_x = 128  # Middle X position for sagittal view
     axial_z = 30      # Middle Z position for axial view
     
-    # Compute global intensity range for all models (for consistent colormapping)
-    all_volumes = [orig_norm] + [metrics_dict[model_name]['pred_norm'] for model_name in list(all_models.keys())]
-    global_vmin = min([v.min() for v in all_volumes])
-    global_vmax = max([v.max() for v in all_volumes])
+    # Use consistent intensity range across all models (based on original)
+    global_vmin = 0
+    global_vmax = 1
     
     # Compute global max error across all models for difference maps
     max_errors = []
@@ -968,8 +978,11 @@ def predict_volume_and_visualize(seed=None, device='cuda', batch_size=8, save_pa
         # Show individual model visualization (legacy)
         print(f"\n3. Generating individual model visualizations...")
         
-        # Normalize original volume once
-        orig_norm = (volume_original - volume_original.min()) / (volume_original.max() - volume_original.min() + 1e-8)
+        # Normalize original volume using consistent range
+        orig_min = volume_original.min()
+        orig_max = volume_original.max()
+        orig_range = orig_max - orig_min + 1e-8
+        orig_norm = (volume_original - orig_min) / orig_range
         
         for model_name, volume_pred in all_models.items():
             metrics = compute_metrics(volume_original, volume_pred)
@@ -983,7 +996,7 @@ def predict_volume_and_visualize(seed=None, device='cuda', batch_size=8, save_pa
             for col, x_pos in enumerate(x_positions):
                 # Original sagittal (top row)
                 orig_sagittal = orig_norm[:, x_pos, :]
-                im0 = axes[0, col].imshow(orig_sagittal.T, cmap='gray', aspect='auto')
+                im0 = axes[0, col].imshow(orig_sagittal.T, cmap='gray', aspect='auto', vmin=0, vmax=1)
                 axes[0, col].set_title(f'Original Sagittal (X={x_pos})', fontsize=11, fontweight='bold', color='darkgreen')
                 axes[0, col].set_xlabel('Slice Index (Z)')
                 axes[0, col].set_ylabel('Y Position')
@@ -991,7 +1004,7 @@ def predict_volume_and_visualize(seed=None, device='cuda', batch_size=8, save_pa
                 
                 # Predicted sagittal (middle row)
                 pred_sagittal = pred_norm[:, x_pos, :]
-                im1 = axes[1, col].imshow(pred_sagittal.T, cmap='gray', aspect='auto')
+                im1 = axes[1, col].imshow(pred_sagittal.T, cmap='gray', aspect='auto', vmin=0, vmax=1)
                 axes[1, col].set_title(f'{model_name.upper()} Sagittal (X={x_pos})', fontsize=11, fontweight='bold', color='darkblue')
                 axes[1, col].set_xlabel('Slice Index (Z)')
                 axes[1, col].set_ylabel('Y Position')
@@ -1012,13 +1025,252 @@ def predict_volume_and_visualize(seed=None, device='cuda', batch_size=8, save_pa
             )
             
             plt.tight_layout()
-            pred_path = results_dir  + '/volume_visualization_all_except_ddpm.png'
-            plt.savefig(pred_path, dpi=150, bbox_inches='tight')
+            
+            # Save if path provided, otherwise just show
+            if save_path:
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                plt.savefig(save_path, dpi=150, bbox_inches='tight')
+                print(f"   ✓ Visualization saved to: {save_path}")
+            
             plt.show()
     
     print(f"\n{'='*70}")
     print(f"✅ PREDICTION COMPLETE!")
     print(f"{'='*70}\n")
+
+
+def predict_volume_all_models_with_fastddpm(seed=None, device='cuda', batch_size=8, save_path=None, view='sagittal'):
+    """
+    Predict full volume using all models including FastDDPM Advanced.
+    Display views of all models side-by-side for easy comparison.
+    
+    Args:
+        seed: Random seed for reproducibility
+        device: 'cuda' or 'cpu'
+        batch_size: Batch size for inference
+        save_path: Path to save the final visualization
+        view: 'sagittal' (Y-Z plane) or 'axial' (X-Y plane) - default 'sagittal'
+    
+    Returns:
+        Dictionary with all predictions and metrics
+    """
+    
+    print(f"\n{'='*70}")
+    print(f"FULL VOLUME PREDICTION - ALL MODELS + FastDDPM")
+    print(f"View: {view.upper()}")
+    print(f"{'='*70}")
+    
+    print(f"\n1. Loading random patient from test set...")
+    data = get_patient_volume_and_triplets(seed=seed)
+    volume_original = data['volume']
+    triplets = data['triplets']
+    patient_name = data['patient_name']
+    
+    print(f"   Patient: {patient_name}")
+    print(f"   Volume shape: {volume_original.shape}")
+    print(f"   Triplets: {len(triplets)}")
+    
+    # Run inference on all triplets with standard models
+    print(f"\n2. Running inference with standard models...")
+    
+    all_models = {}
+    standard_models = ['unet', 'unet_combined', 'deepcnn', 'unet_gan']
+    
+    for model_name in standard_models:
+        print(f"\n   ⏳ Processing {model_name.upper()}...")
+        
+        try:
+            model = load_model(model_name, device=device)
+        except (FileNotFoundError, NotImplementedError) as e:
+            print(f"      ⚠️  Skipped: {str(e)}")
+            continue
+        
+        volume_predicted = volume_original.copy()
+        predictions_dict = {}
+        
+        with torch.no_grad():
+            for pre_batch, post_batch, indices in batch_triplets_for_inference(triplets, batch_size=batch_size):
+                pre_batch = pre_batch.to(device)
+                post_batch = post_batch.to(device)
+                x_input = torch.cat([pre_batch, post_batch], dim=1)
+                predictions = model(x_input)
+                
+                for idx, pred in zip(indices, predictions):
+                    predictions_dict[idx] = pred.cpu().numpy()[0]
+        
+        # Fill predicted volume
+        for idx, pred in predictions_dict.items():
+            if 0 <= idx < volume_predicted.shape[0]:
+                volume_predicted[idx] = pred
+        
+        all_models[model_name] = volume_predicted
+        print(f"      ✓ {model_name.upper()} prediction complete")
+    
+    # Load and run FastDDPM Advanced
+    print(f"\n   ⏳ Processing FASTDDPM ADVANCED...")
+    try:
+        model = load_model('fastddpm', device=device)
+        
+        volume_predicted = volume_original.copy()
+        predictions_dict = {}
+        
+        with torch.no_grad():
+            for pre_batch, post_batch, indices in batch_triplets_for_inference(triplets, batch_size=batch_size):
+                pre_batch = pre_batch.to(device)
+                post_batch = post_batch.to(device)
+                
+                # Concatenate as (B, 2, H, W) for FastDDPM conditions
+                conditions = torch.cat([pre_batch, post_batch], dim=1)
+                
+                # Generate predictions using DDIM sampling with 10 steps
+                pred = model.sample(conditions, device=device)  # (B, 1, H, W)
+                
+                for idx, p in zip(indices, pred):
+                    predictions_dict[idx] = p.cpu().numpy()[0]
+        
+        # Fill predicted volume
+        for idx, pred in predictions_dict.items():
+            if 0 <= idx < volume_predicted.shape[0]:
+                volume_predicted[idx] = pred
+        
+        all_models['fastddpm'] = volume_predicted
+        print(f"      ✓ FASTDDPM prediction complete")
+        
+    except (FileNotFoundError, NotImplementedError) as e:
+        print(f"      ⚠️  Skipped: {str(e)}")
+    except Exception as e:
+        print(f"      ⚠️  Skipped: {str(e)}")
+    
+    # Compute metrics for all models
+    print(f"\n3. Computing metrics for all models...")
+    metrics_dict = {}
+    
+    for model_name, volume_pred in all_models.items():
+        metrics = compute_metrics(volume_original, volume_pred)
+        metrics_dict[model_name] = metrics
+        print(f"   {model_name:15s} | SSIM: {metrics['ssim_mean']:.4f}±{metrics['ssim_std']:.3f} | "
+              f"PSNR: {metrics['psnr_mean']:.2f}±{metrics['psnr_std']:.2f}")
+    
+    # Create comprehensive view visualization
+    print(f"\n4. Generating {view.upper()} view comparison...")
+    
+    num_models = len(all_models) + 1  # +1 for original
+    model_names = ['Original'] + list(all_models.keys())
+    
+    # Normalize original volume using consistent range
+    orig_min = volume_original.min()
+    orig_max = volume_original.max()
+    orig_range = orig_max - orig_min + 1e-8
+    orig_norm = (volume_original - orig_min) / orig_range
+    
+    # Determine position based on view type (single view per model)
+    if view.lower() == 'sagittal':
+        # Sagittal view: Y-Z plane at middle X position
+        position = 128
+        view_label = 'Sagittal (X=128)'
+        view_extractor = lambda vol, pos: vol[:, pos, :]  # (Z, Y)
+    elif view.lower() == 'axial':
+        # Axial view: X-Y plane at middle Z position
+        position = 30
+        view_label = 'Axial (Z=30)'
+        view_extractor = lambda vol, pos: vol[pos, :, :]  # (Y, X)
+    else:
+        raise ValueError(f"Invalid view: {view}. Must be 'sagittal' or 'axial'")
+    
+    # Compute global intensity range for consistent colormapping
+    # Use 0-1 range (normalized based on original volume's range)
+    global_vmin = 0
+    global_vmax = 1
+    
+    # Determine layout based on view type
+    if view.lower() == 'axial':
+        # For axial: use 2 rows to keep image size reasonable
+        num_cols = (num_models + 1) // 2  # ceil division
+        num_rows = 2
+        figsize = (6 * num_cols, 10)
+    else:
+        # For sagittal: use single row with increased size and decreased gaps
+        num_rows = 1
+        num_cols = num_models
+        figsize = (4 * num_models, 6.5)
+    
+    fig = plt.figure(figsize=figsize)
+    
+    for col, (model_idx, model_name) in enumerate(enumerate(model_names)):
+        if model_name == 'Original':
+            volume_to_show = orig_norm
+            metrics = None
+        else:
+            volume_to_show = metrics_dict[model_name]['pred_norm']
+            metrics = metrics_dict[model_name]
+        
+        # Calculate row and column position for 2-row layout
+        if view.lower() == 'axial' and num_rows == 2:
+            row = col // num_cols
+            col_pos = col % num_cols
+            ax = plt.subplot(num_rows, num_cols, row * num_cols + col_pos + 1)
+        else:
+            ax = plt.subplot(1, num_models, col + 1)
+        
+        # Extract view
+        view_data = view_extractor(volume_to_show, position)
+        
+        # Transpose for proper display and set aspect ratio
+        if view.lower() == 'sagittal':
+            # For sagittal: 60 slices (Z) x 256 (Y), use equal aspect to avoid stretching
+            im = ax.imshow(view_data.T, cmap='gray', aspect='equal', origin='lower', 
+                          vmin=global_vmin, vmax=global_vmax)
+        else:  # axial
+            # For axial: 256 (X) x 256 (Y), use auto aspect (normal)
+            im = ax.imshow(view_data, cmap='gray', aspect='auto', origin='lower', 
+                          vmin=global_vmin, vmax=global_vmax)
+        
+        if model_name == 'Original':
+            ax.set_title(f'Original\n{view_label}', fontsize=11, fontweight='bold', color='darkgreen')
+        else:
+            title = f'{model_name.upper()}\nSSIM: {metrics["ssim_mean"]:.4f}'
+            color = 'darkblue' if model_name != 'fastddpm' else 'darkred'
+            ax.set_title(title, fontsize=10, fontweight='bold', color=color)
+        
+        if view.lower() == 'sagittal':
+            ax.set_xlabel('Z', fontsize=9)
+            ax.set_ylabel('Y', fontsize=9)
+        else:  # axial
+            ax.set_xlabel('X', fontsize=9)
+            ax.set_ylabel('Y', fontsize=9)
+        
+        cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label('I', fontsize=8)
+    
+    # Overall title
+    title_str = f'{view.upper()} View Comparison - All Models\nPatient: {patient_name} (Seed: {seed})'
+    fig.suptitle(title_str, fontsize=15, fontweight='bold', y=0.995)
+    
+    # Adjust spacing: smaller gaps for sagittal, normal spacing for axial
+    if view.lower() == 'sagittal':
+        plt.tight_layout(rect=[0, 0, 1, 0.99])
+        plt.subplots_adjust(wspace=0.15, hspace=0.3)
+    else:
+        plt.tight_layout(rect=[0, 0, 1, 0.99])
+    
+    # Save if path provided
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"   ✓ Visualization saved to: {save_path}")
+    
+    plt.show()
+    
+    print(f"\n{'='*70}")
+    print(f"✅ FULL VOLUME PREDICTION COMPLETE!")
+    print(f"{'='*70}\n")
+    
+    return {
+        'volume_original': volume_original,
+        'all_predictions': all_models,
+        'metrics': metrics_dict,
+        'patient_name': patient_name
+    }
 
 
 if __name__ == "__main__":
@@ -1037,16 +1289,16 @@ if __name__ == "__main__":
     #     batch_size=16
     # )
     
-    # Example 3: Hierarchical with all models in parallel visualization
+    # Example 2: Full volume prediction with all models + FastDDPM
     print("\n" + "="*70)
-    print("EXAMPLE 2: Hierarchical 4-Slice (All Models - Parallel Visualization)")
+    print("EXAMPLE 2: Full Volume Prediction (All Models + FastDDPM)")
     print("="*70)
     
-    # predict_volume_hierarchical_all_models(
+    # results = predict_volume_all_models_with_fastddpm(
     #     seed=42,
     #     device='cuda',
-    #     batch_size=16,
-    #     save_path='results/hierarchical_all_models.png'
+    #     batch_size=8,
+    #     save_path='results/sagittal_comparison_all_models.png'
     # )
     
     # Example 3: Data structure exploration
