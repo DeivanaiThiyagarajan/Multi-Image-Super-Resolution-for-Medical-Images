@@ -138,14 +138,15 @@ class TripletSliceDataset(Dataset):
                 n_slices = count_slices(series_folder)
                 if n_slices < 3:
                     continue
-                # Distance 2 triplets: (i, i+2) -> i+1
+                # Distance 2 triplets: (i, i+2) -> i+1 (represents 3mm or 1.5mm interpolation)
                 n_triplets_d2 = n_slices - 2
-                # Distance 4 triplets: (i, i+4) -> i+2
-                n_triplets_d4 = n_slices - 4
-                n_total_triplets = n_triplets_d2 + n_triplets_d4
+                for t in range(n_triplets_d2):
+                    self.triplet_indices.append((pid, series_idx, t, 'dist2'))  # dist2 = 3mm or 1.5mm
                 
-                for t in range(n_total_triplets):
-                    self.triplet_indices.append((pid, series_idx, t))
+                # Distance 4 triplets: (i, i+4) -> i+2 (represents 6mm or 3mm interpolation)
+                n_triplets_d4 = n_slices - 4
+                for t in range(n_triplets_d4):
+                    self.triplet_indices.append((pid, series_idx, n_triplets_d2 + t, 'dist4'))  # dist4 = 6mm or 3mm
         
         # Pre-load all volumes into RAM cache (speeds up training significantly)
         if self.cache_volumes:
@@ -163,7 +164,7 @@ class TripletSliceDataset(Dataset):
         return len(self.triplet_indices)
 
     def __getitem__(self, idx):
-        patient_idx, series_idx, triplet_idx = self.triplet_indices[idx]
+        patient_idx, series_idx, triplet_idx, gap_type = self.triplet_indices[idx]
         
         cache_key = (patient_idx, series_idx)
         
@@ -193,11 +194,11 @@ class TripletSliceDataset(Dataset):
         post = TF.resize(post, target_size, interpolation=TF.InterpolationMode.BILINEAR)
         mid = TF.resize(mid, target_size, interpolation=TF.InterpolationMode.BILINEAR)
 
-        sample = {"pre": pre, "post": post, "target": mid}
+        sample = {"pre": pre, "post": post, "target": mid, "gap_type": gap_type}
         if self.transform:
             sample = self.transform(sample)
 
-        return (sample["pre"], sample["post"]), sample["target"]
+        return (sample["pre"], sample["post"]), sample["target"], sample["gap_type"]
 
 
 def build_dataloader(split="train",
