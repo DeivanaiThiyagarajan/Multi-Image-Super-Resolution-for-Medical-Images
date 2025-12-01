@@ -116,13 +116,21 @@ class PairedTransforms:
     
 
 class TripletSliceDataset(Dataset):
-    def __init__(self, patient_folders, transform=None, cache_volumes=True):
+    def __init__(self, patient_folders, transform=None, cache_volumes=True, distance_filter=None):
+        """
+        Args:
+            patient_folders: List of patient folder paths
+            transform: Data augmentation transform
+            cache_volumes: Whether to cache volumes in RAM
+            distance_filter: None (all), 2 (only distance 2: 3mm/1.5mm), or 4 (only distance 4: 6mm/3mm)
+        """
         self.transform = transform
         self.patient_folders = patient_folders
         self.triplet_indices = []  # Stores (patient_idx, series_idx, triplet_idx)
         self.patient_series_map = {}  # Maps patient_idx to list of series paths
         self.volume_cache = {}  # Cache loaded volumes: (pid, series_idx) -> volume
         self.cache_volumes = cache_volumes
+        self.distance_filter = distance_filter
         
         # Build map of patient -> list of series folders (lazy discovery)
         for pid, folder in enumerate(patient_folders):
@@ -132,21 +140,26 @@ class TripletSliceDataset(Dataset):
             else:
                 self.patient_series_map[pid] = []
         
-        # Build triplet indices (still lazy about loading volumes)
+        # Build triplet indices with optional distance filtering
         for pid, series_list in self.patient_series_map.items():
             for series_idx, series_folder in enumerate(series_list):
                 n_slices = count_slices(series_folder)
                 if n_slices < 3:
                     continue
-                # Distance 2 triplets: (i, i+2) -> i+1 (represents 3mm or 1.5mm interpolation)
-                n_triplets_d2 = n_slices - 2
-                for t in range(n_triplets_d2):
-                    self.triplet_indices.append((pid, series_idx, t, 'dist2'))  # dist2 = 3mm or 1.5mm
                 
-                # Distance 4 triplets: (i, i+4) -> i+2 (represents 6mm or 3mm interpolation)
-                n_triplets_d4 = n_slices - 4
-                for t in range(n_triplets_d4):
-                    self.triplet_indices.append((pid, series_idx, n_triplets_d2 + t, 'dist4'))  # dist4 = 6mm or 3mm
+                # Distance 2 triplets: (i, i+2) -> i+1 (3mm gap / 1.5mm interpolation)
+                if distance_filter is None or distance_filter == 2:
+                    n_triplets_d2 = n_slices - 2
+                    for t in range(n_triplets_d2):
+                        self.triplet_indices.append((pid, series_idx, t))
+                else:
+                    n_triplets_d2 = n_slices - 2  # Still need for distance 4 offset
+                
+                # Distance 4 triplets: (i, i+4) -> i+2 (6mm gap / 3mm interpolation)
+                if distance_filter is None or distance_filter == 4:
+                    n_triplets_d4 = n_slices - 4
+                    for t in range(n_triplets_d4):
+                        self.triplet_indices.append((pid, series_idx, n_triplets_d2 + t))
         
         # Pre-load all volumes into RAM cache (speeds up training significantly)
         if self.cache_volumes:
@@ -164,7 +177,7 @@ class TripletSliceDataset(Dataset):
         return len(self.triplet_indices)
 
     def __getitem__(self, idx):
-        patient_idx, series_idx, triplet_idx, gap_type = self.triplet_indices[idx]
+        patient_idx, series_idx, triplet_idx = self.triplet_indices[idx]
         
         cache_key = (patient_idx, series_idx)
         
@@ -194,22 +207,26 @@ class TripletSliceDataset(Dataset):
         post = TF.resize(post, target_size, interpolation=TF.InterpolationMode.BILINEAR)
         mid = TF.resize(mid, target_size, interpolation=TF.InterpolationMode.BILINEAR)
 
-        sample = {"pre": pre, "post": post, "target": mid, "gap_type": gap_type}
+        sample = {"pre": pre, "post": post, "target": mid}
         if self.transform:
             sample = self.transform(sample)
 
-        return (sample["pre"], sample["post"]), sample["target"], sample["gap_type"]
+        return (sample["pre"], sample["post"]), sample["target"]
 
 
 def build_dataloader(split="train",
                      batch_size=4,
                      augment=False,
-                     num_workers=4):
+                     num_workers=4,
+                     distance_filter=None):
     """
-    base_dir: path to Prostate-MRI-US-Biopsy dataset folder
-    split: "train", "val", "test"
-    batch_size: dataloader batch size
-    augment: whether to apply PairedTransforms
+    Build dataloader with optional distance filtering.
+    
+    Args:
+        split: "train", "val", "test"
+        batch_size: dataloader batch size
+        augment: whether to apply PairedTransforms
+        distance_filter: None (all), 2 (only 3mm/1.5mm), or 4 (only 6mm/3mm)
     """
 
     # ---------------------------------------------------------
@@ -245,7 +262,12 @@ def build_dataloader(split="train",
 
     transform = PairedTransforms() if augment else None
 
-    dataset = TripletSliceDataset(patient_folders, transform, cache_volumes=True)
+    dataset = TripletSliceDataset(
+        patient_folders, 
+        transform, 
+        cache_volumes=True,
+        distance_filter=distance_filter
+    )
 
     # ---------------------------------------------------------
     # Build DataLoader
@@ -264,13 +286,38 @@ def build_dataloader(split="train",
 if __name__ == "__main__":
     BASE = "/path/to/data/manifest-1694710246744/Prostate-MRI-US-Biopsy"
 
-    train_loader = build_dataloader(
-        split="train",
+    # Example: create separate loaders for distance 2 and 4
+    print("\n📊 Creating separate dataloaders by distance...\n")
+    
+    test_loader_dist2 = build_dataloader(
+        split="test",
         batch_size=4,
-        augment=True
+        distance_filter=2  # Only (i, i+2) -> i+1 (3mm/1.5mm)
     )
-
-    for batch in train_loader:
+    
+    test_loader_dist4 = build_dataloader(
+        split="test",
+        batch_size=4,
+        distance_filter=4  # Only (i, i+4) -> i+2 (6mm/3mm)
+    )
+    
+    test_loader_all = build_dataloader(
+        split="test",
+        batch_size=4,
+        distance_filter=None  # All samples
+    )
+    
+    print(f"✅ Distance 2 (3mm/1.5mm) test samples: {len(test_loader_dist2.dataset)}")
+    print(f"✅ Distance 4 (6mm/3mm) test samples:   {len(test_loader_dist4.dataset)}")
+    print(f"✅ All test samples:                     {len(test_loader_all.dataset)}")
+    
+    # Verify data can be loaded
+    for batch in test_loader_dist2:
         (pre, post), mid = batch
-        print(pre.shape, post.shape, mid.shape)
+        print(f"\nDistance 2 batch shapes: pre {pre.shape}, post {post.shape}, mid {mid.shape}")
+        break
+    
+    for batch in test_loader_dist4:
+        (pre, post), mid = batch
+        print(f"Distance 4 batch shapes: pre {pre.shape}, post {post.shape}, mid {mid.shape}")
         break
