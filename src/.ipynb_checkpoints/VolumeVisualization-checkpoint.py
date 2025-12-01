@@ -51,31 +51,32 @@ def load_patient_volume(series_folder_path):
 
 
 def generate_volume_triplets(volume):
-    """Generate triplets from volume for standard models (UNet, DeepCNN, UNet-GAN)"""
+    """Generate triplets from volume for standard models (UNet, DeepCNN, UNet-GAN)
+    
+    Creates pairs (i, i+4) to predict the middle slice (i+2).
+    This allows the model to learn to interpolate with larger gaps.
+    """
     triplets = []
     
-    for i in range(0, volume.shape[0] - 2, 2):
-        pre = volume[i]      # shape (H, W)
-        mid = volume[i + 1]  # shape (H, W)
-        post = volume[i + 2] # shape (H, W)
+    for i in range(0, volume.shape[0] - 4, 2):
+        slice_i = volume[i]        # shape (H, W)
+        slice_i_plus_2 = volume[i + 2]  # shape (H, W) - ground truth middle
+        slice_i_plus_4 = volume[i + 4]  # shape (H, W)
         
-        pre = torch.from_numpy(pre).float().unsqueeze(0)   # (1, H, W)
-        post = torch.from_numpy(post).float().unsqueeze(0) # (1, H, W)
-        mid = torch.from_numpy(mid).float().unsqueeze(0)
+        slice_i = torch.from_numpy(slice_i).float().unsqueeze(0)   # (1, H, W)
+        slice_i_plus_4 = torch.from_numpy(slice_i_plus_4).float().unsqueeze(0) # (1, H, W)
+        slice_i_plus_2 = torch.from_numpy(slice_i_plus_2).float().unsqueeze(0)
         
         target_size = (256, 256)
-        pre = TF.resize(pre, target_size, interpolation=TF.InterpolationMode.BILINEAR)
-        
-        post = TF.resize(post, target_size, interpolation=TF.InterpolationMode.BILINEAR)
-      
-        mid = TF.resize(mid, target_size, interpolation=TF.InterpolationMode.BILINEAR)
-       
+        slice_i = TF.resize(slice_i, target_size, interpolation=TF.InterpolationMode.BILINEAR)
+        slice_i_plus_4 = TF.resize(slice_i_plus_4, target_size, interpolation=TF.InterpolationMode.BILINEAR)
+        slice_i_plus_2 = TF.resize(slice_i_plus_2, target_size, interpolation=TF.InterpolationMode.BILINEAR)
         
         triplet = {
-            'pre': pre,      # (1, H, W)
-            'post': post,    # (1, H, W)
-            'middle': mid,   # (1, H, W)
-            'index': i + 1  # Index of middle slice in original volume
+            'pre': slice_i,           # (1, H, W) - input slice at position i
+            'post': slice_i_plus_4,   # (1, H, W) - input slice at position i+4
+            'middle': slice_i_plus_2, # (1, H, W) - ground truth middle slice at i+2
+            'index': i + 2            # Index of middle slice in original volume
         }
         triplets.append(triplet)
     
