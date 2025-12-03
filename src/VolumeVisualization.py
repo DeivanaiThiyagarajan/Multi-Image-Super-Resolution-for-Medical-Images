@@ -58,25 +58,28 @@ def generate_volume_triplets(volume):
     """
     triplets = []
     
-    for i in range(0, volume.shape[0] - 4, 2):
-        slice_i = volume[i]        # shape (H, W)
-        slice_i_plus_2 = volume[i + 2]  # shape (H, W) - ground truth middle
-        slice_i_plus_4 = volume[i + 4]  # shape (H, W)
+    for i in range(0, volume.shape[0] - 2, 2):
+        pre = volume[i]      # shape (H, W)
+        mid = volume[i + 1]  # shape (H, W)
+        post = volume[i + 2] # shape (H, W)
         
-        slice_i = torch.from_numpy(slice_i).float().unsqueeze(0)   # (1, H, W)
-        slice_i_plus_4 = torch.from_numpy(slice_i_plus_4).float().unsqueeze(0) # (1, H, W)
-        slice_i_plus_2 = torch.from_numpy(slice_i_plus_2).float().unsqueeze(0)
+        pre = torch.from_numpy(pre).float().unsqueeze(0)   # (1, H, W)
+        post = torch.from_numpy(post).float().unsqueeze(0) # (1, H, W)
+        mid = torch.from_numpy(mid).float().unsqueeze(0)
         
         target_size = (256, 256)
-        slice_i = TF.resize(slice_i, target_size, interpolation=TF.InterpolationMode.BILINEAR)
-        slice_i_plus_4 = TF.resize(slice_i_plus_4, target_size, interpolation=TF.InterpolationMode.BILINEAR)
-        slice_i_plus_2 = TF.resize(slice_i_plus_2, target_size, interpolation=TF.InterpolationMode.BILINEAR)
+        pre = TF.resize(pre, target_size, interpolation=TF.InterpolationMode.BILINEAR)
+        
+        post = TF.resize(post, target_size, interpolation=TF.InterpolationMode.BILINEAR)
+      
+        mid = TF.resize(mid, target_size, interpolation=TF.InterpolationMode.BILINEAR)
+       
         
         triplet = {
-            'pre': slice_i,           # (1, H, W) - input slice at position i
-            'post': slice_i_plus_4,   # (1, H, W) - input slice at position i+4
-            'middle': slice_i_plus_2, # (1, H, W) - ground truth middle slice at i+2
-            'index': i + 2            # Index of middle slice in original volume
+            'pre': pre,      # (1, H, W)
+            'post': post,    # (1, H, W)
+            'middle': mid,   # (1, H, W)
+            'index': i + 1  # Index of middle slice in original volume
         }
         triplets.append(triplet)
     
@@ -304,7 +307,7 @@ def visualize_all_models_parallel(all_models, volume_original, patient_name, see
     model_names = ['Original'] + list(all_models.keys())
     
     # 3 views per model (sagittal, axial, difference)
-    fig = plt.figure(figsize=(20, 6 * num_models))
+    fig = plt.figure(figsize=(15, 4 * num_models))
     
     # Select slice indices for visualization
     sagittal_x = 128  # Middle X position for sagittal view
@@ -338,15 +341,13 @@ def visualize_all_models_parallel(all_models, volume_original, patient_name, see
         im_sag = ax_sag.imshow(sagittal_view.T, cmap='gray', aspect='auto', origin='lower', vmin=global_vmin, vmax=global_vmax)
         
         if model_name == 'Original':
-            ax_sag.set_title(f'Sagittal View (X={sagittal_x})', fontsize=12, fontweight='bold', color='darkgreen')
+            ax_sag.set_title(f'Sagittal View (X={sagittal_x})', fontsize=16, fontweight='bold', color='darkgreen')
         else:
             title = f'{model_name.upper()} - Sagittal\nSSIM: {metrics["ssim_mean"]:.4f} | PSNR: {metrics["psnr_mean"]:.2f}'
-            ax_sag.set_title(title, fontsize=11, fontweight='bold', color='darkblue')
+            ax_sag.set_title(title, fontsize=15, fontweight='bold', color='darkblue')
         
-        ax_sag.set_xlabel('Slice Index (Z)', fontsize=10)
-        ax_sag.set_ylabel('Y Position', fontsize=10)
-        cbar_sag = plt.colorbar(im_sag, ax=ax_sag, fraction=0.046, pad=0.04)
-        cbar_sag.set_label('Intensity', fontsize=9)
+        ax_sag.set_xlabel('Slice Index (Z)', fontsize=13)
+        ax_sag.set_ylabel('Y Position', fontsize=13)
         
         # ===== AXIAL VIEW (X-Y plane at z=axial_z) =====
         ax_ax = plt.subplot(num_models, 3, row * 3 + 2)
@@ -355,15 +356,13 @@ def visualize_all_models_parallel(all_models, volume_original, patient_name, see
         im_ax = ax_ax.imshow(axial_view, cmap='gray', aspect='auto', origin='lower', vmin=global_vmin, vmax=global_vmax)
         
         if model_name == 'Original':
-            ax_ax.set_title(f'Axial View (Z={axial_z})', fontsize=12, fontweight='bold', color='darkgreen')
+            ax_ax.set_title(f'Axial View (Z={axial_z})', fontsize=16, fontweight='bold', color='darkgreen')
         else:
             title = f'{model_name.upper()} - Axial\nMAE: {metrics["mae"]:.4f}'
-            ax_ax.set_title(title, fontsize=11, fontweight='bold', color='darkgreen')
+            ax_ax.set_title(title, fontsize=15, fontweight='bold', color='darkgreen')
         
-        ax_ax.set_xlabel('X Position', fontsize=10)
-        ax_ax.set_ylabel('Y Position', fontsize=10)
-        cbar_ax = plt.colorbar(im_ax, ax=ax_ax, fraction=0.046, pad=0.04)
-        cbar_ax.set_label('Intensity', fontsize=9)
+        ax_ax.set_xlabel('X Position', fontsize=13)
+        ax_ax.set_ylabel('Y Position', fontsize=13)
         
         # ===== DIFFERENCE MAP (only for predictions, not original) =====
         ax_diff = plt.subplot(num_models, 3, row * 3 + 3)
@@ -372,23 +371,23 @@ def visualize_all_models_parallel(all_models, volume_original, patient_name, see
             # For original, show sagittal view again (no difference)
             diff_view = sagittal_view.T
             im_diff = ax_diff.imshow(diff_view, cmap='gray', aspect='auto', origin='lower', vmin=global_vmin, vmax=global_vmax)
-            ax_diff.set_title(f'Sagittal Repeat (X={sagittal_x})', fontsize=12, fontweight='bold', color='darkgreen')
+            ax_diff.set_title(f'Sagittal Repeat (X={sagittal_x})', fontsize=16, fontweight='bold', color='darkgreen')
         else:
             # Show difference map with consistent scale
             sagittal_orig = orig_norm[:, sagittal_x, :]
             sagittal_pred = volume_to_show[:, sagittal_x, :]
             diff = np.abs(sagittal_orig - sagittal_pred)
             im_diff = ax_diff.imshow(diff.T, cmap='hot', aspect='auto', origin='lower', vmin=0, vmax=global_max_error)
-            ax_diff.set_title(f'{model_name.upper()} - Difference\nMax Error: {np.max(diff):.4f}', fontsize=11, fontweight='bold', color='darkred')
+            ax_diff.set_title(f'{model_name.upper()} - Difference\nMax Error: {np.max(diff):.4f}', fontsize=15, fontweight='bold', color='darkred')
         
-        ax_diff.set_xlabel('Slice Index (Z)', fontsize=10)
-        ax_diff.set_ylabel('Y Position', fontsize=10)
+        ax_diff.set_xlabel('Slice Index (Z)', fontsize=13)
+        ax_diff.set_ylabel('Y Position', fontsize=13)
         cbar_diff = plt.colorbar(im_diff, ax=ax_diff, fraction=0.046, pad=0.04)
-        cbar_diff.set_label('Error' if model_name != 'Original' else 'Intensity', fontsize=9)
+        cbar_diff.set_label('Error' if model_name != 'Original' else 'Intensity', fontsize=11)
     
     # Overall title
     title_str = f'Multi-Model Comparison - Sagittal, Axial & Difference Maps\nPatient: {patient_name} (Seed: {seed})'
-    fig.suptitle(title_str, fontsize=15, fontweight='bold', y=0.995)
+    fig.suptitle(title_str, fontsize=18, fontweight='bold', y=0.995)
     
     plt.tight_layout(rect=[0, 0, 1, 0.99])
     
@@ -834,21 +833,21 @@ def visualize_single_triplet_all_models(seed=None, device='cuda', save_path=None
         # PRE slice
         ax_pre_model = plt.subplot(num_models, 4, row_idx * 4 + 1)
         im_pre_model = ax_pre_model.imshow(pre_norm, cmap='gray')
-        ax_pre_model.set_title(f'PRE\n(Slice {middle_index - 1})', fontsize=11, fontweight='bold', color='darkblue')
+        ax_pre_model.set_title(f'PRE\n(Slice {middle_index - 1})', fontsize=14, fontweight='bold', color='darkblue')
         ax_pre_model.axis('off')
         plt.colorbar(im_pre_model, ax=ax_pre_model, fraction=0.046, pad=0.04)
         
         # POST slice
         ax_post_model = plt.subplot(num_models, 4, row_idx * 4 + 2)
         im_post_model = ax_post_model.imshow(post_norm, cmap='gray')
-        ax_post_model.set_title(f'POST\n(Slice {middle_index + 1})', fontsize=11, fontweight='bold', color='darkblue')
+        ax_post_model.set_title(f'POST\n(Slice {middle_index + 1})', fontsize=14, fontweight='bold', color='darkblue')
         ax_post_model.axis('off')
         plt.colorbar(im_post_model, ax=ax_post_model, fraction=0.046, pad=0.04)
         
         # GROUND TRUTH slice
         ax_gt_model = plt.subplot(num_models, 4, row_idx * 4 + 3)
         im_gt_model = ax_gt_model.imshow(gt_middle_norm, cmap='gray')
-        ax_gt_model.set_title(f'GROUND TRUTH\n(Slice {middle_index})', fontsize=11, fontweight='bold', color='darkgreen')
+        ax_gt_model.set_title(f'GROUND TRUTH\n(Slice {middle_index})', fontsize=14, fontweight='bold', color='darkgreen')
         ax_gt_model.axis('off')
         plt.colorbar(im_gt_model, ax=ax_gt_model, fraction=0.046, pad=0.04)
         
@@ -859,13 +858,13 @@ def visualize_single_triplet_all_models(seed=None, device='cuda', save_path=None
         # Calculate MSE with ground truth
         mse = np.mean((gt_middle_norm - pred_norm) ** 2)
         
-        ax_pred_model.set_title(f'{model_name.upper()}\nMSE: {mse:.4f}', fontsize=11, fontweight='bold', color='darkred')
+        ax_pred_model.set_title(f'{model_name.upper()}\nMSE: {mse:.4f}', fontsize=14, fontweight='bold', color='darkred')
         ax_pred_model.axis('off')
         plt.colorbar(im_pred_model, ax=ax_pred_model, fraction=0.046, pad=0.04)
     
     # Overall title
     title_str = f'Single Triplet Prediction Comparison - All Models\nPatient: {patient_name} (Triplet Index: {triplet_idx}, Seed: {seed})'
-    fig.suptitle(title_str, fontsize=14, fontweight='bold', y=0.995)
+    fig.suptitle(title_str, fontsize=17, fontweight='bold', y=0.995)
     
     plt.tight_layout(rect=[0, 0, 1, 0.99])
     
@@ -998,31 +997,31 @@ def predict_volume_and_visualize(seed=None, device='cuda', batch_size=8, save_pa
                 # Original sagittal (top row)
                 orig_sagittal = orig_norm[:, x_pos, :]
                 im0 = axes[0, col].imshow(orig_sagittal.T, cmap='gray', aspect='auto', vmin=0, vmax=1)
-                axes[0, col].set_title(f'Original Sagittal (X={x_pos})', fontsize=11, fontweight='bold', color='darkgreen')
-                axes[0, col].set_xlabel('Slice Index (Z)')
-                axes[0, col].set_ylabel('Y Position')
+                axes[0, col].set_title(f'Original Sagittal (X={x_pos})', fontsize=14, fontweight='bold', color='darkgreen')
+                axes[0, col].set_xlabel('Slice Index (Z)', fontsize=12)
+                axes[0, col].set_ylabel('Y Position', fontsize=12)
                 plt.colorbar(im0, ax=axes[0, col], fraction=0.046)
                 
                 # Predicted sagittal (middle row)
                 pred_sagittal = pred_norm[:, x_pos, :]
                 im1 = axes[1, col].imshow(pred_sagittal.T, cmap='gray', aspect='auto', vmin=0, vmax=1)
-                axes[1, col].set_title(f'{model_name.upper()} Sagittal (X={x_pos})', fontsize=11, fontweight='bold', color='darkblue')
-                axes[1, col].set_xlabel('Slice Index (Z)')
-                axes[1, col].set_ylabel('Y Position')
+                axes[1, col].set_title(f'{model_name.upper()} Sagittal (X={x_pos})', fontsize=14, fontweight='bold', color='darkblue')
+                axes[1, col].set_xlabel('Slice Index (Z)', fontsize=12)
+                axes[1, col].set_ylabel('Y Position', fontsize=12)
                 plt.colorbar(im1, ax=axes[1, col], fraction=0.046)
                 
                 # Difference map (bottom row)
                 diff = np.abs(orig_sagittal - pred_sagittal)
                 im2 = axes[2, col].imshow(diff.T, cmap='hot', aspect='auto')
-                axes[2, col].set_title(f'Difference (X={x_pos})', fontsize=11, fontweight='bold', color='darkred')
-                axes[2, col].set_xlabel('Slice Index (Z)')
-                axes[2, col].set_ylabel('Y Position')
+                axes[2, col].set_title(f'Difference (X={x_pos})', fontsize=14, fontweight='bold', color='darkred')
+                axes[2, col].set_xlabel('Slice Index (Z)', fontsize=12)
+                axes[2, col].set_ylabel('Y Position', fontsize=12)
                 plt.colorbar(im2, ax=axes[2, col], fraction=0.046)
             
             fig.suptitle(
                 f'{model_name.upper()} - Volume Prediction Comparison\n'
                 f'Patient: {patient_name} | SSIM: {metrics["ssim_mean"]:.4f} | PSNR: {metrics["psnr_mean"]:.2f} dB | MAE: {metrics["mae"]:.4f}',
-                fontsize=13, fontweight='bold'
+                fontsize=16, fontweight='bold'
             )
             
             plt.tight_layout()
@@ -1120,11 +1119,11 @@ def predict_volume_all_models_with_fastddpm(seed=None, device='cuda', batch_size
                 pre_batch = pre_batch.to(device)
                 post_batch = post_batch.to(device)
                 
-                # Concatenate as (B, 2, H, W) for FastDDPM conditions
-                conditions = torch.cat([pre_batch, post_batch], dim=1)
+                # Concatenate as (B, 2, H, W) for FastDDPM
+                cond = torch.cat([pre_batch, post_batch], dim=1)
                 
-                # Generate predictions using DDIM sampling with 10 steps
-                pred = model.sample(conditions, device=device)  # (B, 1, H, W)
+                # Generate predictions using DDIM sampling
+                pred = model.sample(cond, device)  # (B, 1, H, W)
                 
                 for idx, p in zip(indices, pred):
                     predictions_dict[idx] = p.cpu().numpy()[0]
@@ -1141,6 +1140,7 @@ def predict_volume_all_models_with_fastddpm(seed=None, device='cuda', batch_size
         print(f"      ⚠️  Skipped: {str(e)}")
     except Exception as e:
         print(f"      ⚠️  Skipped: {str(e)}")
+    
     
     # Compute metrics for all models
     print(f"\n3. Computing metrics for all models...")
@@ -1188,12 +1188,12 @@ def predict_volume_all_models_with_fastddpm(seed=None, device='cuda', batch_size
         # For axial: use 2 rows to keep image size reasonable
         num_cols = (num_models + 1) // 2  # ceil division
         num_rows = 2
-        figsize = (6 * num_cols, 10)
+        figsize = (4 * num_cols, 8)
     else:
         # For sagittal: use single row with increased size and decreased gaps
         num_rows = 1
         num_cols = num_models
-        figsize = (4 * num_models, 6.5)
+        figsize = (2 * num_models, 5.5)
     
     fig = plt.figure(figsize=figsize)
     
@@ -1227,25 +1227,22 @@ def predict_volume_all_models_with_fastddpm(seed=None, device='cuda', batch_size
                           vmin=global_vmin, vmax=global_vmax)
         
         if model_name == 'Original':
-            ax.set_title(f'Original\n{view_label}', fontsize=11, fontweight='bold', color='darkgreen')
+            ax.set_title(f'Original\n{view_label}', fontsize=14, fontweight='bold', color='darkgreen')
         else:
             title = f'{model_name.upper()}\nSSIM: {metrics["ssim_mean"]:.4f}'
             color = 'darkblue' if model_name != 'fastddpm' else 'darkred'
-            ax.set_title(title, fontsize=10, fontweight='bold', color=color)
+            ax.set_title(title, fontsize=13, fontweight='bold', color=color)
         
         if view.lower() == 'sagittal':
-            ax.set_xlabel('Z', fontsize=9)
-            ax.set_ylabel('Y', fontsize=9)
+            ax.set_xlabel('Z', fontsize=12)
+            ax.set_ylabel('Y', fontsize=12)
         else:  # axial
-            ax.set_xlabel('X', fontsize=9)
-            ax.set_ylabel('Y', fontsize=9)
-        
-        cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        cbar.set_label('I', fontsize=8)
+            ax.set_xlabel('X', fontsize=12)
+            ax.set_ylabel('Y', fontsize=12)
     
     # Overall title
     title_str = f'{view.upper()} View Comparison - All Models\nPatient: {patient_name} (Seed: {seed})'
-    fig.suptitle(title_str, fontsize=15, fontweight='bold', y=0.995)
+    fig.suptitle(title_str, fontsize=18, fontweight='bold', y=0.995)
     
     # Adjust spacing: smaller gaps for sagittal, normal spacing for axial
     if view.lower() == 'sagittal':
