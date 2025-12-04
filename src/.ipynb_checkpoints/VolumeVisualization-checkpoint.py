@@ -781,7 +781,7 @@ def visualize_single_triplet_all_models(seed=None, device='cuda', save_path=None
     print(f"\n2. Running inference with all models...")
     
     all_predictions = {}
-    model_list = ['unet', 'unet_combined', 'deepcnn', 'progressive_unet', 'unet_gan']
+    model_list = ['unet', 'unet_combined', 'unet_gan']
     
     for model_name in model_list:
         print(f"   ⏳ Processing {model_name.upper()}...")
@@ -863,7 +863,7 @@ def visualize_single_triplet_all_models(seed=None, device='cuda', save_path=None
         plt.colorbar(im_pred_model, ax=ax_pred_model, fraction=0.046, pad=0.04)
     
     # Overall title
-    title_str = f'Single Triplet Prediction Comparison - All Models\nPatient: {patient_name} (Triplet Index: {triplet_idx}, Seed: {seed})'
+    title_str = f'Single Triplet Prediction Comparison - All Models, Seed: {seed})'
     fig.suptitle(title_str, fontsize=17, fontweight='bold', y=0.995)
     
     plt.tight_layout(rect=[0, 0, 1, 0.99])
