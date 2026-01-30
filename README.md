@@ -1,4 +1,48 @@
+# Multi-Image Super-Resolution for Medical Slice Interpolation
 
+This repository contains code, experiments, and analysis for **multi-image super-resolution (slice interpolation)** in prostate MRI. The goal is to synthesize missing intermediate MRI slices by conditioning on neighboring slices, improving through-plane resolution without additional scanning.
+
+The project compares **deterministic CNN/UNet models**, **adversarial training**, **progressive multi-stage interpolation**, and **fast diffusion models (Fast-DDPM)** on a large prostate MRI biopsy dataset with **3 mm and 6 mm inter-slice spacing**.
+
+📄 This repository accompanies the report:  
+**“Multi-Image Super-Resolution for Medical Slice Interpolation”**  
+*Deivanai Thiyagarajan, University of Florida*
+
+---
+
+## Key Ideas
+
+- **Multi-image slice interpolation**: Predict a missing middle slice using two neighboring slices.
+- **Variable spacing awareness**:
+  - **Short-range interpolation (3 mm gap)**: slices *(i, i+2 → i+1)*
+  - **Long-range interpolation (6 mm gap)**: slices *(i, i+4 → i+2)*
+- **Progressive interpolation**: Decompose large-gap prediction into easier sub-problems using a hierarchical UNet pipeline.
+- **Loss design matters**: Combining pixel-wise, perceptual, and structural losses significantly improves reconstruction fidelity.
+- **Diffusion models**: Fast-DDPM offers probabilistic generation and fast inference, but currently underperforms deterministic UNets for this task.
+
+---
+
+## Repository Structure
+
+├── src/ # Model architectures, training loops, data loaders
+│ ├── models/ # UNet, DeepCNN, Progressive UNet, Fast-DDPM
+│ ├── losses/ # MSE, perceptual (VGG), SSIM losses
+│ ├── data/ # Triplet and window-based data generators
+│ └── visualization/ # Slice and volume visualization utilities
+│
+├── notebooks/ # Training, evaluation, and analysis notebooks
+│
+├── data/ # Dataset manifests (DICOM data excluded)
+│
+├── models/ # Saved checkpoints
+│ ├── unet_mse_best.pt
+│ ├── unet_combined_best.pt
+│ ├── unet_gan_best.pt
+│ ├── progressive_unet_best.pt
+│ └── fast_ddpm_best.pt
+│
+├── results/ # Training curves and qualitative visualizations
+└── requirements.txt
 ---
 
 ## Dataset
