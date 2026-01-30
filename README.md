@@ -23,7 +23,7 @@ The project compares **deterministic CNN/UNet models**, **adversarial training**
 ---
 
 ## Repository Structure
-
+```bash
 ├── src/ # Model architectures, training loops, data loaders
 │ ├── models/ # UNet, DeepCNN, Progressive UNet, Fast-DDPM
 │ ├── losses/ # MSE, perceptual (VGG), SSIM losses
@@ -43,6 +43,7 @@ The project compares **deterministic CNN/UNet models**, **adversarial training**
 │
 ├── results/ # Training curves and qualitative visualizations
 └── requirements.txt
+```
 ---
 
 ## Dataset
